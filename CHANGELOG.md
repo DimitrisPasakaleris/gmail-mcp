@@ -39,5 +39,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OAuth scope is `https://mail.google.com/` (full Gmail access) — documented
   in `SECURITY.md`.
 
-[Unreleased]: https://github.com/CHANGE_ME/gmail-mcp/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/CHANGE_ME/gmail-mcp/releases/tag/v1.0.0
+[Unreleased]: https://github.com/DimitrisPasakaleris/gmail-mcp/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/DimitrisPasakaleris/gmail-mcp/releases/tag/v1.0.0

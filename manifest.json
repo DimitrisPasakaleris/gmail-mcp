@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "description": "MCP server connecting Claude Desktop to Gmail via OAuth — search, read, send, reply, manage labels, drafts, and attachments.",
   "author": {
-    "name": "gmail-mcp contributors"
+    "name": "Dimitris Pasakaleris"
   },
-  "homepage": "https://github.com/CHANGE_ME/gmail-mcp",
+  "homepage": "https://github.com/DimitrisPasakaleris/gmail-mcp",
   "license": "MIT",
   "server": {
     "type": "python",

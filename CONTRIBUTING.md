@@ -6,7 +6,7 @@ dev environment up, running tests, and submitting a change.
 ## Quick start
 
 ```bash
-git clone https://github.com/CHANGE_ME/gmail-mcp.git
+git clone https://github.com/DimitrisPasakaleris/gmail-mcp.git
 cd gmail-mcp
 python -m venv .venv
 # Windows: .venv\Scripts\activate
