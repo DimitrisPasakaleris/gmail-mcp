@@ -1,0 +1,9 @@
+# Runtime dependencies. For most users, prefer `pip install -e .` which reads
+# pyproject.toml. This file is kept for compatibility with workflows that
+# expect a plain requirements.txt.
+
+mcp>=1.0.0
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.0.0
+keyring>=25.0.0

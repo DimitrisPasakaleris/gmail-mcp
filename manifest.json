@@ -1,0 +1,25 @@
+{
+  "manifest_version": "0.3",
+  "name": "gmail-mcp",
+  "version": "1.0.0",
+  "description": "MCP server connecting Claude Desktop to Gmail via OAuth — search, read, send, reply, manage labels, drafts, and attachments.",
+  "author": {
+    "name": "gmail-mcp contributors"
+  },
+  "homepage": "https://github.com/CHANGE_ME/gmail-mcp",
+  "license": "MIT",
+  "server": {
+    "type": "python",
+    "entry_point": "src/gmail_mcp/server.py"
+  },
+  "dependencies": {
+    "required": [
+      "mcp>=1.0.0",
+      "google-api-python-client>=2.0.0",
+      "google-auth-httplib2>=0.2.0",
+      "google-auth-oauthlib>=1.0.0",
+      "keyring>=25.0.0"
+    ]
+  },
+  "instructions": "Install: 1) Download credentials.json from Google Cloud Console (see docs/google-cloud-setup.md), 2) Run 'pip install -e .' from the project root, 3) Run 'gmail-mcp' (or 'python -m gmail_mcp') once to authenticate, 4) Register with Claude Desktop via 'mcp install src/gmail_mcp/server.py --name gmail-mcp'."
+}

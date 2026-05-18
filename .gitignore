@@ -1,0 +1,43 @@
+# Secrets / runtime — never commit these
+credentials.json
+client_secret_*.json
+token.json
+*.log
+
+# Build artifacts
+*.mcpb
+dist/
+build/
+*.egg-info/
+
+# User data
+attachments/
+Downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+~
