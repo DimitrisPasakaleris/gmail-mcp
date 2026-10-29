@@ -221,6 +221,7 @@ def _unique_save_path(path: Path) -> Path:
 
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_MESSAGE_BYTES = 35 * 1024 * 1024
 
 
 def _build_mime_message(
@@ -261,9 +262,10 @@ def _build_mime_message(
         mime = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
         main, sub = mime.split("/", 1)
         msg.add_attachment(data, maintype=main, subtype=sub, filename=os.path.basename(filepath))
-    encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
-    if len(encoded) > 35 * 1024 * 1024:
-        raise ValueError("Encoded message exceeds the 35 MiB limit")
+    mime_bytes = msg.as_bytes()
+    if len(mime_bytes) > MAX_MESSAGE_BYTES:
+        raise ValueError("MIME message exceeds the 35 MiB limit")
+    encoded = base64.urlsafe_b64encode(mime_bytes).decode("ascii").rstrip("=")
     return encoded, sender
 
 
@@ -1376,9 +1378,10 @@ def update_draft(
                 rebuilt.make_mixed()
                 for part in parts:
                     rebuilt.attach(deepcopy(part))
-        encoded = base64.urlsafe_b64encode(rebuilt.as_bytes()).decode("ascii").rstrip("=")
-        if len(encoded) > 35 * 1024 * 1024:
-            return err(ERROR_VALIDATION, "Updated draft exceeds the encoded message size limit")
+        mime_bytes = rebuilt.as_bytes()
+        if len(mime_bytes) > MAX_MESSAGE_BYTES:
+            return err(ERROR_VALIDATION, "Updated draft exceeds the MIME message size limit")
+        encoded = base64.urlsafe_b64encode(mime_bytes).decode("ascii").rstrip("=")
         update = {"raw": encoded}
         if message.get("threadId"):
             update["threadId"] = message["threadId"]

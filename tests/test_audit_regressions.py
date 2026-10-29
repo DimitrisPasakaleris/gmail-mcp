@@ -431,3 +431,13 @@ def test_download_size_limit_is_enforced_before_writing(service, monkeypatch):
     target = Path.home() / "oversize.bin"
     assert tools.download_attachment("msg", "att", str(target))["error"] == tools.ERROR_VALIDATION
     assert not target.exists()
+
+
+def test_message_limit_checks_mime_bytes_before_transport_encoding(monkeypatch):
+    raw, _ = tools._build_mime_message("a@example.com", "Subject", "Body")
+    size = len(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    monkeypatch.setattr(tools, "MAX_MESSAGE_BYTES", size)
+    assert tools._build_mime_message("a@example.com", "Subject", "Body")[0]
+    monkeypatch.setattr(tools, "MAX_MESSAGE_BYTES", size - 1)
+    with pytest.raises(ValueError, match="MIME message"):
+        tools._build_mime_message("a@example.com", "Subject", "Body")
