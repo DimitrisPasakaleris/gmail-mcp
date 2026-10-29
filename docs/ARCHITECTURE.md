@@ -49,7 +49,7 @@ Tools always return `{"ok": True, "data": ...}` or `{"ok": False, "error": "..."
 | Family | Suffix pattern | API mechanism | Use when |
 |--------|----------------|---------------|----------|
 | **Single** | `read_email`, `add_label`, `archive_email`, … | 1 Gmail API call per tool invocation | One message at a time |
-| **Batch** | `read_emails`, `add_labels`, `archive_emails`, … | `batchModify` (1 call) or `BatchHttpRequest` (1 round-trip, up to 100 calls) | Operating on many message IDs at once |
+| **Batch** | `read_emails`, `add_labels`, `archive_emails`, … | `batchModify` (1000 IDs/call) or `BatchHttpRequest` (100 calls/batch), automatically chunked | Operating on many message IDs at once |
 | **File export** | `read_emails_full`, `search_and_save`, `append_emails` | Same as batch, but writes the result to disk | Result set is too big for the MCP output channel |
 
 The single/batch pairs exist deliberately — they are **not** code duplication.
@@ -89,9 +89,16 @@ Three files live in that directory:
 
 ## Service caching
 
-`auth._service_cache` holds the authenticated `googleapiclient` resource at
-module level. First tool call builds it; subsequent calls reuse it. Tests
-clear it via `auth.clear_service_cache()`.
+Each worker thread holds its own authenticated `googleapiclient` resource in
+thread-local storage because Google's httplib2 transport is not thread-safe.
+Credential loading/refresh and token writes are serialized. The first tool call
+in each thread builds and verifies its service; subsequent calls reuse it.
+`auth.clear_service_cache()` invalidates caches for all threads.
+
+Logs and OAuth prompts never write to the stdio protocol stream. Tokens and
+exports are written to temporary files in the destination directory and replaced
+atomically. Concurrent appends are serialized within one server process; separate
+server processes should use separate export files.
 
 ## Why FastMCP
 

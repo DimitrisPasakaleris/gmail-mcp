@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import sys
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 # Module-level service cache — initialized lazily on first tool call.
 _service_cache: Any = None
+_service_thread = threading.local()
+_auth_lock = threading.Lock()
 
 
 class AuthError(Exception):
@@ -29,7 +33,7 @@ class AuthError(Exception):
 def _is_headless() -> bool:
     """Return True if we appear to be running in a headless environment (no DISPLAY)."""
     return (
-        sys.platform != "win32"
+        sys.platform not in ("win32", "darwin")
         and not os.environ.get("DISPLAY")
         and not os.environ.get("WAYLAND_DISPLAY")
     )
@@ -40,8 +44,11 @@ def _migrate_legacy_token() -> None:
     legacy_token = Path.cwd() / "token.json"
     if legacy_token.exists() and not config.token_path.exists():
         config.token_path.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-        shutil.copy2(legacy_token, config.token_path)
+        try:
+            credentials = Credentials.from_authorized_user_file(str(legacy_token), config.scopes)
+            _save_token_filesystem(credentials)
+        except (ValueError, OSError) as exc:
+            raise AuthError("Legacy token is invalid or could not be migrated.", requires_auth=True) from exc
         logger.info("Migrated token.json from %s to %s", legacy_token, config.token_path)
 
 
@@ -49,13 +56,25 @@ def _load_token_filesystem() -> Credentials | None:
     _migrate_legacy_token()
     if not config.token_path.exists():
         return None
-    return Credentials.from_authorized_user_file(str(config.token_path), config.scopes)
+    try:
+        return Credentials.from_authorized_user_file(str(config.token_path), config.scopes)
+    except (ValueError, OSError) as exc:
+        raise AuthError(
+            "Cached token could not be read. Repair or replace token.json and authenticate again.",
+            requires_auth=True,
+        ) from exc
 
 
 def _save_token_filesystem(creds: Credentials) -> None:
     config.token_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config.token_path, "w") as f:
-        f.write(creds.to_json())
+    fd, temporary = tempfile.mkstemp(dir=config.token_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+        os.replace(temporary, config.token_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     logger.info("Token saved to %s", config.token_path)
 
 
@@ -67,8 +86,14 @@ def _load_token_keyring() -> Credentials | None:
     raw = keyring.get_password(config.service_name, "token")
     if not raw:
         return None
-    info = json.loads(raw)
-    return Credentials.from_authorized_user_info(info, config.scopes)
+    try:
+        info = json.loads(raw)
+        return Credentials.from_authorized_user_info(info, config.scopes)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise AuthError(
+            "Cached keyring token is invalid. Reauthenticate after repairing the keyring entry.",
+            requires_auth=True,
+        ) from exc
 
 
 def _save_token_keyring(creds: Credentials) -> None:
@@ -104,17 +129,15 @@ def _attempt_auth_flow() -> Credentials:
             "To authenticate:\n"
             f"  1. Copy your credentials.json to: {config.credentials_path}\n"
             "  2. Run this command in a terminal with a browser:\n"
-            "     python -c \"from gmail_mcp.auth import get_gmail_service; get_gmail_service()\"\n"
+            '     python -c "from gmail_mcp.auth import get_gmail_service; get_gmail_service()"\n'
             "  3. Follow the browser prompts to authorize.\n"
             "  4. Restart Claude Desktop.",
             requires_auth=True,
         )
 
     logger.info("Starting OAuth browser flow...")
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(config.credentials_path), config.scopes
-    )
-    creds = flow.run_local_server(port=0)
+    flow = InstalledAppFlow.from_client_secrets_file(str(config.credentials_path), config.scopes)
+    creds = flow.run_local_server(port=0, authorization_prompt_message="")
     logger.info("OAuth flow completed successfully.")
     return creds
 
@@ -169,10 +192,14 @@ def get_gmail_service() -> Any:
     """
     global _service_cache
 
-    if _service_cache is not None:
-        return _service_cache
+    cached = getattr(_service_thread, "service", None)
+    if cached is not None:
+        return cached
 
-    creds = _get_valid_credentials()
+    # Google API's httplib2 transport is not thread-safe. Each MCP worker
+    # owns its own service, while OAuth and token writes are serialized.
+    with _auth_lock:
+        creds = _get_valid_credentials()
 
     # Verify we got a valid email address
     try:
@@ -182,14 +209,16 @@ def get_gmail_service() -> Any:
         logger.info("Authenticated as %s", email)
     except Exception as e:
         logger.error("Failed to verify auth: %s", e)
-        raise AuthError(f"Authentication verification failed: {e}")
+        raise AuthError(f"Authentication verification failed: {e}") from e
 
     _service_cache = temp_svc
-    return _service_cache
+    _service_thread.service = temp_svc
+    return temp_svc
 
 
 def clear_service_cache() -> None:
     """Clear the cached service. Useful for testing or token refresh."""
-    global _service_cache
+    global _service_cache, _service_thread
     _service_cache = None
+    _service_thread = threading.local()
     logger.info("Service cache cleared")

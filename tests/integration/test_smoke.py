@@ -4,23 +4,42 @@ The bulk of this file runs as plain unit checks (no network, no credentials).
 The single tool round-trip at the bottom is marked `integration` and only
 runs when GMAIL_TEST_REAL=1 — it hits real Gmail.
 """
+
 from __future__ import annotations
 
 import os
 
 import pytest
 
-from gmail_mcp import __version__
-from gmail_mcp import auth, config as config_module, tools
-
+from gmail_mcp import __version__, auth, tools
+from gmail_mcp import config as config_module
 
 PUBLIC_TOOLS = (
-    "list_emails", "get_thread_messages", "read_email", "send_email", "reply_email",
-    "archive_email", "trash_email", "mark_read", "add_label", "remove_label",
-    "create_draft", "list_drafts", "update_draft", "delete_draft",
-    "list_attachments", "download_attachment",
-    "read_emails", "mark_emails_read", "archive_emails", "trash_emails", "add_labels",
-    "download_attachments", "read_emails_full", "search_and_save", "append_emails",
+    "list_emails",
+    "get_thread_messages",
+    "read_email",
+    "send_email",
+    "reply_email",
+    "archive_email",
+    "trash_email",
+    "mark_read",
+    "add_label",
+    "remove_label",
+    "create_draft",
+    "list_drafts",
+    "update_draft",
+    "delete_draft",
+    "list_attachments",
+    "download_attachment",
+    "read_emails",
+    "mark_emails_read",
+    "archive_emails",
+    "trash_emails",
+    "add_labels",
+    "download_attachments",
+    "read_emails_full",
+    "search_and_save",
+    "append_emails",
 )
 
 
@@ -55,9 +74,16 @@ def test_response_helpers() -> None:
 
 def test_error_codes_defined() -> None:
     for name in (
-        "ERROR_AUTH_MISSING", "ERROR_AUTH_EXPIRED", "ERROR_API", "ERROR_NOT_FOUND",
-        "ERROR_VALIDATION", "ERROR_ATTACHMENT_NOT_FOUND", "ERROR_FILE_NOT_FOUND",
-        "ERROR_DRAFT_NOT_FOUND", "ERROR_INVALID_LABEL", "ERROR_THREAD_NOT_FOUND",
+        "ERROR_AUTH_MISSING",
+        "ERROR_AUTH_EXPIRED",
+        "ERROR_API",
+        "ERROR_NOT_FOUND",
+        "ERROR_VALIDATION",
+        "ERROR_ATTACHMENT_NOT_FOUND",
+        "ERROR_FILE_NOT_FOUND",
+        "ERROR_DRAFT_NOT_FOUND",
+        "ERROR_INVALID_LABEL",
+        "ERROR_THREAD_NOT_FOUND",
         "ERROR_INTERNAL",
     ):
         assert hasattr(tools, name), f"{name} not defined"

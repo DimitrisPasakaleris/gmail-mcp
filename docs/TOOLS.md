@@ -93,6 +93,9 @@ Each takes `message_id` (str). `archive_email` removes the `INBOX` label;
 ### update_draft
 
 Only non-empty fields replace the existing draft.
+The body is required. Omitted attachments (`None`) preserve existing files and
+inline images; an explicit `[]` removes files. Empty recipient/subject fields
+retain their values. Thread metadata is preserved.
 
 | Param | Type | Required |
 |-------|------|----------|
@@ -121,14 +124,16 @@ Returns attachment metadata (name, size, attachment_id, mime type) for a message
 |-------|------|-------|
 | `message_id` | str | |
 | `attachment_id` | str | From `list_attachments`. |
-| `save_path` | str | Local path. Parent dir must exist. 25 MB ceiling per file. |
+| `save_path` | str | Local path inside home/config. Parents are created. 25 MiB ceiling per file. Existing files receive a unique suffix. |
 
 ## Batch tools
 
 These accept arrays of IDs and bundle all operations into **one MCP request**.
-Label operations use Gmail's `batchModify` (1 API call regardless of how many
-IDs). Read operations use `BatchHttpRequest` (1 HTTP round-trip, up to 100
-sub-requests).
+Label operations use Gmail's `batchModify` with at most 1000 IDs per API call.
+Reads and downloads use `BatchHttpRequest` with at most 100 sub-requests per
+round trip. Larger inputs are chunked automatically. Results preserve input
+order, duplicate message IDs, and individual failures. Custom label names are
+resolved to Gmail IDs before modification.
 
 ### read_emails
 
@@ -138,8 +143,8 @@ sub-requests).
 | `save_to_file` | bool, optional — force save |
 | `max_chars` | int, default `30000` — auto-save threshold |
 
-Auto-save behavior: if the estimated inline output exceeds `max_chars`, the
-result is written to `~/.config/gmail-mcp/emails/<timestamp>-<slug>.md` and
+Auto-save behavior: if the estimated or actual inline output exceeds `max_chars`, the
+result is written under the configured directory's `emails/` child and
 the response carries a compact summary + file path instead of full bodies.
 
 ### mark_emails_read / archive_emails / trash_emails
@@ -203,6 +208,11 @@ hundreds of emails without hitting MCP output limits.
 | `format` | str | `"md"` (also: `"json"`, `"jsonl"`, `"csv"`) |
 
 Returns path + count + total size; no email bodies inline.
+The response also reports succeeded/failed counts. Markdown retains full bodies;
+JSON/JSONL preserve complete extracted records with an `ok` flag; CSV includes
+full text/HTML bodies, identifiers, and errors. Labels are a JSON array in CSV.
+These exports do not contain attachment bytes or the original raw MIME message.
+An explicit destination may be replaced atomically by this tool.
 
 ### search_and_save
 
@@ -211,18 +221,31 @@ Returns path + count + total size; no email bodies inline.
 | Param | Type | Default |
 |-------|------|---------|
 | `query` | str | required |
-| `max_results` | int | `100` |
+| `max_results` | int | `100`, integer from 1 to 5000 |
 | `save_path` | str | auto-generated if empty |
 | `format` | str | `"md"` |
 
 Example: `search_and_save("from:PiraeusBank after:2026/03/01", max_results=100, format="md")`.
+Search follows Gmail page tokens to the requested limit. Existing destination
+files are rejected; use a new path or `append_emails`.
 
 ### append_emails
 
 Append more emails to an existing `.md`, `.json`, or `.jsonl` file. Useful
 for pagination loops.
+Writes preserve the existing file on errors. JSON totals are updated, and
+appended bodies are complete. Concurrent appends are serialized within one
+server process; use separate files across multiple server processes.
 
 | Param | Type |
 |-------|------|
 | `message_ids` | list[str] |
 | `save_path` | str — path to the existing file |
+
+## Delivery and retry behavior
+
+Safe reads and label operations retry transient HTTP 429/503 or network errors
+up to three attempts. Delays are bounded at 60 seconds; a larger Retry-After
+surfaces the error instead of retrying before the server permits it.
+Mail sends and draft creation are submitted once. If the response is lost,
+check Gmail before retrying to avoid duplicates.
