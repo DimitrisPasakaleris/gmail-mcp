@@ -2,26 +2,23 @@ import base64
 import json
 import logging
 import math
+import mimetypes
 import os
-import re
+import threading
 import time
-from datetime import datetime
-from email import encoders
+from datetime import UTC, datetime
 from email.message import EmailMessage
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from email.utils import formatdate
 from pathlib import Path
-from typing import Any, Optional
-
-import mimetypes
+from typing import Any
 
 from googleapiclient.errors import HttpError
 
-from .auth import get_gmail_service, AuthError
+from .auth import AuthError, get_gmail_service
+from .config import config
 
 logger = logging.getLogger(__name__)
+_FILE_LOCK = threading.RLock()
 
 # ── Error codes ──────────────────────────────────────────────────────────────
 ERROR_AUTH_MISSING = "auth_missing"
@@ -36,6 +33,7 @@ ERROR_INVALID_LABEL = "invalid_label"
 ERROR_THREAD_NOT_FOUND = "thread_not_found"
 ERROR_INTERNAL = "internal_error"
 
+
 # ── Response helpers ─────────────────────────────────────────────────────────
 def ok(data: Any) -> dict:
     return {"ok": True, "data": data}
@@ -47,109 +45,124 @@ def err(code: str, message: str) -> dict:
 
 # ── Retry helper ─────────────────────────────────────────────────────────────
 def _with_retry(fn, max_retries: int = 3, base_delay: float = 1.0):
-    """
-    Retry a callable with exponential backoff and jitter.
-    Retries on HttpError 429 (rate limit) and 503 (unavailable).
-    Returns the result of fn() or raises the last exception.
-    """
-    last_exc: Exception | None = None
+    """Bounded retries for safe operations; callers disable retries for creates/sends."""
+    import random
+    from email.utils import parsedate_to_datetime
+
+    if type(max_retries) is not int or max_retries < 1:
+        raise ValueError("max_retries must be a positive integer")
+    if not math.isfinite(base_delay) or base_delay < 0:
+        raise ValueError("base_delay must be finite and nonnegative")
     for attempt in range(max_retries):
         try:
-            result = fn()
-            if attempt > 0:
-                logger.debug("Retry succeeded on attempt %d/%d", attempt + 1, max_retries)
-            return result
-        except HttpError as e:
-            status = e.resp.status
-            if status not in (429, 503):
+            return fn()
+        except (HttpError, TimeoutError, ConnectionError, OSError) as exc:
+            if isinstance(exc, HttpError) and exc.resp.status not in (429, 503):
                 raise
-
-            # Respect Retry-After header if present
-            retry_after = e.resp.get("retry-after")
-            if retry_after:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(60.0, base_delay * (2 ** min(attempt, 10)))
+            if isinstance(exc, HttpError) and (value := exc.resp.get("retry-after")):
                 try:
-                    delay = float(retry_after)
-                except ValueError:
-                    delay = base_delay * (2 ** attempt)
-            else:
-                delay = base_delay * (2 ** attempt)
-
-            # Add jitter: +/- 20%
-            import random
-            delay = delay * (0.8 + 0.4 * random.random())
-            logger.warning("Rate-limited (%d), retrying in %.1fs (attempt %d/%d)",
-                           status, delay, attempt + 1, max_retries)
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-            last_exc = e
-        except (TimeoutError, ConnectionError, OSError) as e:
-            # Transient network errors
-            delay = base_delay * (2 ** attempt)
-            import random
-            delay = delay * (0.8 + 0.4 * random.random())
-            logger.warning("Network error: %s, retrying in %.1fs (attempt %d/%d)",
-                           e, delay, attempt + 1, max_retries)
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-            last_exc = e
-
-    # All retries exhausted
-    raise last_exc
+                    try:
+                        minimum = float(value)
+                    except ValueError:
+                        minimum = (parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds()
+                    if math.isfinite(minimum) and minimum >= 0:
+                        if minimum > 60:
+                            raise exc
+                        delay = minimum
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            delay = min(60.0, delay * (1 + 0.2 * random.random()))
+            logger.warning("Transient API error; retrying in %.1fs", delay)
+            time.sleep(delay)
+    raise RuntimeError("Unreachable retry state")
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 def _parse_recipients(header_value: str) -> list[str]:
-    """
-    Extract plain email addresses from a header value like
-    'Alice <alice@example.com>, bob@example.com'.
-    """
-    addresses = []
-    pattern = re.compile(r'<([^>]+)>|([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)')
-    for match in pattern.finditer(header_value):
-        addr = match.group(1) or match.group(2)
-        if addr and addr not in addresses:
-            addresses.append(addr.strip())
-    return addresses
+    from email.utils import getaddresses
+
+    return list(
+        dict.fromkeys(address for _, address in getaddresses([header_value]) if address and "@" in address)
+    )
+
+
+def _headers(payload: dict) -> dict[str, str]:
+    return {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
 
 
 def _attachment_id_to_part(payload: dict, attachment_id: str) -> dict | None:
     """Recursively find the message part with matching body.attachmentId."""
-    if "parts" in payload:
-        for part in payload["parts"]:
-            found = _attachment_id_to_part(part, attachment_id)
-            if found:
-                return found
-    else:
-        if payload.get("body", {}).get("attachmentId") == attachment_id:
-            return payload
+    if payload.get("body", {}).get("attachmentId") == attachment_id:
+        return payload
+    for part in payload.get("parts", []):
+        found = _attachment_id_to_part(part, attachment_id)
+        if found:
+            return found
     return None
 
 
 def _extract_body(payload: dict) -> tuple[str | None, str | None]:
-    """Recursively find text/plain and text/html parts. Returns (plain, html)."""
-    plain = None
-    html = None
+    """Decode message text using its declared charset, excluding file attachments."""
+    if payload.get("filename") or _headers(payload).get("content-disposition", "").lower().startswith(
+        "attachment"
+    ):
+        return None, None
+    plain, html = None, None
+    for part in payload.get("parts", []):
+        p, h = _extract_body(part)
+        plain = plain if plain is not None else p
+        html = html if html is not None else h
+    data = payload.get("body", {}).get("data")
+    mime = payload.get("mimeType", "").lower()
+    if data is not None and mime in ("text/plain", "text/html"):
+        from email.message import Message
 
-    if "parts" in payload:
-        for part in payload["parts"]:
-            p, h = _extract_body(part)
-            plain = plain or p
-            html = html or h
-            if plain and html:
-                break
-    else:
-        mime = payload.get("mimeType", "")
-        data = payload.get("body", {}).get("data")
-        if data:
-            # Gmail API returns base64url without padding — add padding back
-            padded = data + "=" * (-len(data) % 4)
-            decoded = base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
-            if mime == "text/plain":
-                plain = decoded
-            elif mime == "text/html":
-                html = decoded
-
+        header = Message()
+        header["Content-Type"] = _headers(payload).get("content-type", mime)
+        charset = header.get_content_charset() or "utf-8"
+        raw = base64.b64decode(data + "=" * (-len(data) % 4), altchars=b"-_", validate=True)
+        try:
+            decoded = raw.decode(charset, errors="replace")
+        except LookupError:
+            decoded = raw.decode("utf-8", errors="replace")
+        if mime == "text/plain":
+            plain = decoded
+        else:
+            html = decoded
     return plain, html
+
+
+def _prepare_body(service, msg: dict) -> None:
+    """Retrieve text bodies Gmail stores separately, without downloading attached files."""
+
+    def hydrate(payload):
+        if payload.get("filename") or _headers(payload).get("content-disposition", "").lower().startswith(
+            "attachment"
+        ):
+            return
+        body = payload.get("body", {})
+        if (
+            payload.get("mimeType") in ("text/plain", "text/html")
+            and "data" not in body
+            and body.get("attachmentId")
+        ):
+            response = _with_retry(
+                lambda: (
+                    service.users()
+                    .messages()
+                    .attachments()
+                    .get(userId="me", messageId=msg["id"], id=body["attachmentId"])
+                    .execute()
+                )
+            )
+            body["data"] = response["data"]
+        for part in payload.get("parts", []):
+            hydrate(part)
+
+    hydrate(msg.get("payload", {}))
 
 
 def _safe_save_path(requested: str, config_dir: Path) -> Path:
@@ -158,7 +171,8 @@ def _safe_save_path(requested: str, config_dir: Path) -> Path:
     Returns the safe absolute path, or raises ValueError with a clear message.
     """
     # Resolve to absolute path
-    path = Path(requested).resolve()
+    path = Path(requested).expanduser().resolve()
+    config_dir = config_dir.expanduser().resolve()
 
     # Guard against path traversal: disallow paths outside config dir or home
     home = Path.home().resolve()
@@ -183,8 +197,8 @@ def _safe_save_path(requested: str, config_dir: Path) -> Path:
     if not parent.exists():
         try:
             parent.mkdir(parents=True, exist_ok=True)
-        except PermissionError as e:
-            raise ValueError(f"Cannot create directory '{parent}': {e}")
+        except OSError as e:
+            raise ValueError(f"Cannot create directory '{parent}': {e}") from e
 
     if parent.exists() and not os.access(parent, os.W_OK):
         raise ValueError(f"Directory '{parent}' is not writable.")
@@ -206,88 +220,102 @@ def _unique_save_path(path: Path) -> Path:
     return path
 
 
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+
 def _build_mime_message(
     to: str,
     subject: str,
     body: str,
     cc: str = "",
     bcc: str = "",
-    attachments: Optional[list[str]] = None,
+    attachments: list[str] | None = None,
     in_reply_to: str = "",
     references: str = "",
     sender: str = "",
 ) -> tuple[str, str]:
-    """
-    Build a MIME email message, optionally with attachments.
-    Returns (raw_encoded, from_address).
-
-    raw_encoded is base64url-encoded without padding.
-    """
-    if attachments is None:
-        attachments = []
-
-    has_attachments = bool(attachments)
-
-    if has_attachments:
-        msg = MIMEMultipart('mixed')
-    else:
-        msg = EmailMessage()
-
-    msg['To'] = to
-    if cc:
-        msg['Cc'] = cc
-    if bcc:
-        msg['Bcc'] = bcc
-    msg['Subject'] = subject
-    msg['Date'] = formatdate(localtime=True)
-
-    if in_reply_to:
-        msg['In-Reply-To'] = in_reply_to
-    if references:
-        msg['References'] = references
-
-    if has_attachments:
-        body_part = MIMEText(body, 'plain')
-        msg.attach(body_part)
-
-        for filepath in attachments:
-            if not os.path.isfile(filepath):
-                raise FileNotFoundError(f"Attachment file not found: {filepath}")
-            filename = os.path.basename(filepath)
-
-            file_size = os.path.getsize(filepath)
-            if file_size > 25 * 1024 * 1024:
-                raise ValueError(f"Attachment too large: {filepath} ({file_size} bytes, max 25MB)")
-
-            mime_type, _ = mimetypes.guess_type(filepath)
-            if not mime_type:
-                mime_type = 'application/octet-stream'
-
-            try:
-                main_type, sub_type = mime_type.split('/')
-            except ValueError:
-                main_type, sub_type = 'application', 'octet-stream'
-
-            with open(filepath, 'rb') as f:
-                part = MIMEBase(main_type, sub_type)
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
-            part.replace_header('Content-Type', mime_type)
-            msg.attach(part)
-    else:
-        msg.set_content(body)
-
-    raw_bytes = msg.as_bytes()
-    encoded = base64.urlsafe_b64encode(raw_bytes).decode('utf-8').rstrip('=')
+    """Build an RFC-compliant message; attachments have a combined 25 MiB limit."""
+    msg = EmailMessage()
+    for key, value in (
+        ("To", to),
+        ("Subject", subject),
+        ("Cc", cc),
+        ("Bcc", bcc),
+        ("From", sender),
+        ("In-Reply-To", in_reply_to),
+        ("References", references),
+    ):
+        if value or key in ("To", "Subject"):
+            msg[key] = value
+    msg["Date"] = formatdate(localtime=True)
+    msg.set_content(body)
+    total = 0
+    for filepath in attachments or []:
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"Attachment file not found: {filepath}")
+        with open(filepath, "rb") as stream:
+            data = stream.read(MAX_ATTACHMENT_BYTES + 1)
+        total += len(data)
+        if total > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Attachments exceed the combined 25 MiB limit")
+        mime = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+        main, sub = mime.split("/", 1)
+        msg.add_attachment(data, maintype=main, subtype=sub, filename=os.path.basename(filepath))
+    encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+    if len(encoded) > 35 * 1024 * 1024:
+        raise ValueError("Encoded message exceeds the 35 MiB limit")
     return encoded, sender
+
+
+def _decode_attachment(encoded: str) -> bytes:
+    if not isinstance(encoded, str):
+        raise ValueError("Attachment data must be base64 text")
+    if len(encoded) > ((MAX_ATTACHMENT_BYTES + 2) // 3) * 4:
+        raise ValueError("Attachment exceeds the 25 MiB limit")
+    try:
+        data = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("Invalid base64 attachment data") from exc
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError("Attachment exceeds the 25 MiB limit")
+    return data
+
+
+def _write_attachment(path: Path, data: bytes) -> Path:
+    """Reserve the filename exclusively; never overwrite a competing download."""
+    while True:
+        target = _unique_save_path(path)
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        return target
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    import tempfile
+
+    fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="") as stream:
+            stream.write(content)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _get_service():
     """Get the Gmail service, surfacing auth errors clearly."""
     try:
         return get_gmail_service()
-    except AuthError as e:
+    except AuthError:
         raise  # Let tools catch and return auth_missing
 
 
@@ -316,6 +344,9 @@ def list_emails(query: str = "", max_results: int = 5) -> dict:
       Leave query empty to get recent inbox. Use Gmail search syntax
       to filter: from:, subject:, after:, before:, is:unread, has:attachment.
     """
+    if type(max_results) is not int or not 1 <= max_results <= 500:
+        return err(ERROR_VALIDATION, "max_results must be an integer between 1 and 500")
+
     try:
         service = _get_service()
     except AuthError as e:
@@ -326,10 +357,7 @@ def list_emails(query: str = "", max_results: int = 5) -> dict:
 
     try:
         response = _with_retry(
-            lambda: service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=max_results)
-                .execute()
+            lambda: service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
         )
     except HttpError as e:
         return err(ERROR_API, str(e))
@@ -343,11 +371,12 @@ def list_emails(query: str = "", max_results: int = 5) -> dict:
         msg_id = msg_ref["id"]
         try:
             msg = _with_retry(
-                lambda mid=msg_id: service.users()
+                lambda mid=msg_id: (
+                    service.users()
                     .messages()
-                    .get(userId="me", id=mid, format="metadata",
-                         metadataHeaders=["Subject", "From", "Date"])
+                    .get(userId="me", id=mid, format="metadata", metadataHeaders=["Subject", "From", "Date"])
                     .execute()
+                )
             )
         except HttpError as e:
             logger.debug("list_emails: skipping message %s due to HttpError: %s", msg_id, e)
@@ -356,20 +385,25 @@ def list_emails(query: str = "", max_results: int = 5) -> dict:
             logger.debug("list_emails: skipping message %s due to error: %s", msg_id, e)
             continue
 
-        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-        emails.append({
-            "id": msg_id,
-            "subject": headers.get("Subject", "(no subject)"),
-            "from": headers.get("From", "unknown"),
-            "date": headers.get("Date", ""),
-            "snippet": msg.get("snippet", ""),
-            "labels": msg.get("labelIds", []),
-        })
+        headers = _headers(msg.get("payload", {}))
+        emails.append(
+            {
+                "id": msg_id,
+                "thread_id": msg.get("threadId", ""),
+                "subject": headers.get("subject", "(no subject)"),
+                "from": headers.get("from", "unknown"),
+                "date": headers.get("date", ""),
+                "snippet": msg.get("snippet", ""),
+                "labels": msg.get("labelIds", []),
+            }
+        )
 
-    return ok({
-        "total": int(response.get("resultSizeEstimate", len(emails))),
-        "emails": emails,
-    })
+    return ok(
+        {
+            "total": int(response.get("resultSizeEstimate", len(emails))),
+            "emails": emails,
+        }
+    )
 
 
 # ── Tool: get_thread_messages ───────────────────────────────────────────────
@@ -408,12 +442,7 @@ def get_thread_messages(thread_id: str) -> dict:
         return err(ERROR_INTERNAL, str(e))
 
     try:
-        thread = _with_retry(
-            lambda: service.users()
-                .threads()
-                .get(userId="me", id=thread_id)
-                .execute()
-        )
+        thread = _with_retry(lambda: service.users().threads().get(userId="me", id=thread_id).execute())
     except HttpError as e:
         if e.resp.status == 404:
             return err(ERROR_THREAD_NOT_FOUND, f"Thread not found: {thread_id}")
@@ -423,21 +452,25 @@ def get_thread_messages(thread_id: str) -> dict:
 
     messages_out = []
     for msg in thread.get("messages", []):
-        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+        headers = _headers(msg.get("payload", {}))
         plain, _ = _extract_body(msg.get("payload", {}))
-        messages_out.append({
-            "id": msg["id"],
-            "subject": headers.get("Subject", "(no subject)"),
-            "from": headers.get("From", "unknown"),
-            "date": headers.get("Date", ""),
-            "snippet": plain or msg.get("snippet", ""),
-        })
+        messages_out.append(
+            {
+                "id": msg["id"],
+                "subject": headers.get("subject", "(no subject)"),
+                "from": headers.get("from", "unknown"),
+                "date": headers.get("date", ""),
+                "snippet": plain or msg.get("snippet", ""),
+            }
+        )
 
-    return ok({
-        "thread_id": thread_id,
-        "total": len(messages_out),
-        "messages": messages_out,
-    })
+    return ok(
+        {
+            "thread_id": thread_id,
+            "total": len(messages_out),
+            "messages": messages_out,
+        }
+    )
 
 
 # ── Tool: send_email ────────────────────────────────────────────────────────
@@ -450,7 +483,7 @@ def send_email(
     thread_id: str = "",
     in_reply_to: str = "",
     references: str = "",
-    attachments: Optional[list[str]] = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """
     Send a new email. Can thread into an existing conversation by including
@@ -499,9 +532,7 @@ def send_email(
         return err(ERROR_INTERNAL, str(e))
 
     try:
-        profile = _with_retry(
-            lambda: service.users().getProfile(userId="me").execute()
-        )
+        profile = _with_retry(lambda: service.users().getProfile(userId="me").execute())
         sender = profile.get("emailAddress", "")
     except HttpError as e:
         return err(ERROR_API, f"Failed to get sender profile: {e}")
@@ -510,33 +541,50 @@ def send_email(
 
     try:
         encoded, _ = _build_mime_message(
-            to=to, subject=subject, body=body,
-            cc=cc, bcc=bcc, attachments=attachments,
-            in_reply_to=in_reply_to, references=references,
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            attachments=attachments,
+            in_reply_to=in_reply_to,
+            references=references,
             sender=sender,
         )
-    except FileNotFoundError as e:
+    except OSError as e:
         return err(ERROR_FILE_NOT_FOUND, str(e))
     except ValueError as e:
         return err(ERROR_VALIDATION, str(e))
 
     send_body = {"raw": encoded}
+    if thread_id:
+        send_body["threadId"] = thread_id
 
     try:
         sent = _with_retry(
-            lambda: service.users().messages().send(userId="me", body=send_body).execute()
+            lambda: service.users().messages().send(userId="me", body=send_body).execute(), max_retries=1
         )
     except HttpError as e:
-        return err(ERROR_API, str(e))
+        return err(
+            ERROR_API,
+            "Email delivery could not be confirmed. Check Gmail before retrying to avoid duplicates. Details: "
+            + str(e),
+        )
     except Exception as e:
-        return err(ERROR_API, str(e))
+        return err(
+            ERROR_API,
+            "Email delivery could not be confirmed. Check Gmail before retrying to avoid duplicates. Details: "
+            + str(e),
+        )
 
-    return ok({
-        "message_id": sent.get("id", ""),
-        "thread_id": sent.get("threadId", ""),
-        "to": to,
-        "subject": subject,
-    })
+    return ok(
+        {
+            "message_id": sent.get("id", ""),
+            "thread_id": sent.get("threadId", ""),
+            "to": to,
+            "subject": subject,
+        }
+    )
 
 
 # ── Tool: reply_email ────────────────────────────────────────────────────────
@@ -600,11 +648,17 @@ def reply_email(
 
     try:
         original = _with_retry(
-            lambda: service.users()
+            lambda: (
+                service.users()
                 .messages()
-                .get(userId="me", id=in_reply_to, format="metadata",
-                     metadataHeaders=["Subject", "From", "To", "Cc"])
+                .get(
+                    userId="me",
+                    id=in_reply_to,
+                    format="metadata",
+                    metadataHeaders=["Subject", "From", "To", "Cc", "Message-ID", "References"],
+                )
                 .execute()
+            )
         )
     except HttpError as e:
         if e.resp.status == 404:
@@ -613,21 +667,43 @@ def reply_email(
     except Exception as e:
         return err(ERROR_API, str(e))
 
-    headers = {h["name"]: h["value"] for h in original.get("payload", {}).get("headers", [])}
+    headers = _headers(original.get("payload", {}))
+
+    if original.get("threadId") and original["threadId"] != thread_id:
+        return err(ERROR_VALIDATION, "Original message does not belong to the supplied thread")
+    rfc_message_id = headers.get("message-id", "")
+    if not rfc_message_id:
+        return err(
+            ERROR_VALIDATION,
+            "Original message has no Message-ID header; a threaded reply cannot be constructed",
+        )
+    references_header = " ".join(filter(None, (headers.get("references", ""), rfc_message_id)))
+    own_address = ""
+    if reply_all:
+        try:
+            own_address = (
+                _with_retry(lambda: service.users().getProfile(userId="me").execute())
+                .get("emailAddress", "")
+                .lower()
+            )
+        except Exception as exc:
+            return err(ERROR_API, f"Could not determine reply-all sender: {exc}")
 
     if not actual_subject:
-        original_subject = headers.get("Subject", "")
+        original_subject = headers.get("subject", "")
         if original_subject.lower().startswith("re:"):
             actual_subject = original_subject
         else:
             actual_subject = f"Re: {original_subject}"
 
-    if reply_all and not cc:
-        extra_ccs = []
-        for hdr_val in [headers.get("To", ""), headers.get("Cc", "")]:
+    if reply_all:
+        extra_ccs: list[str] = []
+        for hdr_val in [cc, headers.get("to", ""), headers.get("cc", "")]:
             if hdr_val:
                 for r in _parse_recipients(hdr_val):
-                    if r != to and r not in extra_ccs:
+                    if r.lower() not in {a.lower() for a in _parse_recipients(to)} | {
+                        own_address
+                    } and r.lower() not in {a.lower() for a in extra_ccs}:
                         extra_ccs.append(r)
         if extra_ccs:
             actual_cc = ", ".join(extra_ccs)
@@ -639,8 +715,8 @@ def reply_email(
         cc=actual_cc,
         bcc=bcc,
         thread_id=thread_id,
-        in_reply_to=in_reply_to,
-        references=in_reply_to,
+        in_reply_to=rfc_message_id,
+        references=references_header,
     )
 
 
@@ -678,10 +754,7 @@ def read_email(message_id: str) -> dict:
 
     try:
         msg = _with_retry(
-            lambda: service.users()
-                .messages()
-                .get(userId="me", id=message_id, format="full")
-                .execute()
+            lambda: service.users().messages().get(userId="me", id=message_id, format="full").execute()
         )
     except HttpError as e:
         if e.resp.status == 404:
@@ -690,8 +763,12 @@ def read_email(message_id: str) -> dict:
     except Exception as e:
         return err(ERROR_API, str(e))
 
-    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-    plain_body, html_body = _extract_body(msg.get("payload", {}))
+    headers = _headers(msg.get("payload", {}))
+    try:
+        _prepare_body(service, msg)
+        plain_body, html_body = _extract_body(msg.get("payload", {}))
+    except Exception as exc:
+        return err(ERROR_API, f"Invalid message body: {exc}")
 
     internal_date = msg.get("internalDate", "")
     if internal_date:
@@ -700,18 +777,22 @@ def read_email(message_id: str) -> dict:
         except Exception:
             date_str = internal_date
     else:
-        date_str = headers.get("Date", "")
+        date_str = headers.get("date", "")
 
-    return ok({
-        "id": message_id,
-        "subject": headers.get("Subject", "(no subject)"),
-        "from": headers.get("From", "unknown"),
-        "to": headers.get("To", "unknown"),
-        "date": date_str,
-        "body": plain_body,
-        "html_body": html_body,
-        "labels": msg.get("labelIds", []),
-    })
+    return ok(
+        {
+            "id": message_id,
+            "subject": headers.get("subject", "(no subject)"),
+            "from": headers.get("from", "unknown"),
+            "to": headers.get("to", "unknown"),
+            "cc": headers.get("cc", ""),
+            "thread_id": msg.get("threadId", ""),
+            "date": date_str,
+            "body": plain_body,
+            "html_body": html_body,
+            "labels": msg.get("labelIds", []),
+        }
+    )
 
 
 # ── Label helpers ────────────────────────────────────────────────────────────
@@ -728,13 +809,17 @@ def _modify_labels(message_id: str, add: list[str], remove: list[str]) -> dict:
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
+    try:
+        add = [_resolve_label(service, label) for label in add]
+        remove = [_resolve_label(service, label) for label in remove]
+    except ValueError as exc:
+        return err(ERROR_INVALID_LABEL, str(exc))
+    except Exception as exc:
+        return err(ERROR_API, str(exc))
     body = {"addLabelIds": add, "removeLabelIds": remove}
     try:
         updated = _with_retry(
-            lambda: service.users()
-                .messages()
-                .modify(userId="me", id=message_id, body=body)
-                .execute()
+            lambda: service.users().messages().modify(userId="me", id=message_id, body=body).execute()
         )
     except HttpError as e:
         if e.resp.status == 404:
@@ -743,10 +828,12 @@ def _modify_labels(message_id: str, add: list[str], remove: list[str]) -> dict:
     except Exception as e:
         return err(ERROR_API, str(e))
 
-    return ok({
-        "message_id": message_id,
-        "labels": updated.get("labelIds", []),
-    })
+    return ok(
+        {
+            "message_id": message_id,
+            "labels": updated.get("labelIds", []),
+        }
+    )
 
 
 def archive_email(message_id: str) -> dict:
@@ -876,10 +963,7 @@ def list_attachments(message_id: str) -> dict:
 
     try:
         msg = _with_retry(
-            lambda: service.users()
-                .messages()
-                .get(userId="me", id=message_id, format="full")
-                .execute()
+            lambda: service.users().messages().get(userId="me", id=message_id, format="full").execute()
         )
     except HttpError as e:
         if e.resp.status == 404:
@@ -902,12 +986,14 @@ def list_attachments(message_id: str) -> dict:
             filename = payload.get("filename")
             attachment_id = payload.get("body", {}).get("attachmentId")
             if filename and attachment_id:
-                attachments.append({
-                    "id": attachment_id,
-                    "filename": filename,
-                    "mime_type": payload.get("mimeType", "application/octet-stream"),
-                    "size": int(payload.get("body", {}).get("size", 0)),
-                })
+                attachments.append(
+                    {
+                        "id": attachment_id,
+                        "filename": filename,
+                        "mime_type": payload.get("mimeType", "application/octet-stream"),
+                        "size": int(payload.get("body", {}).get("size", 0)),
+                    }
+                )
 
     _collect_parts(msg.get("payload", {}))
 
@@ -956,71 +1042,63 @@ def download_attachment(
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    # Resolve filename from message payload (if available) — but don't fail
-    # if it isn't, since list_attachments already gave us a working attachment ID.
     filename = "unknown"
     try:
         msg = _with_retry(
-            lambda: service.users()
-                .messages()
-                .get(userId="me", id=message_id, format="metadata",
-                     metadataHeaders=[])
-                .execute()
+            lambda: service.users().messages().get(userId="me", id=message_id, format="full").execute()
         )
-        # Extract filename from payload if present
-        def _find_filename(payload: dict) -> str:
-            if payload.get("filename"):
-                return payload.get("filename", "")
-            if "parts" in payload:
-                for p in payload["parts"]:
-                    f = _find_filename(p)
-                    if f:
-                        return f
-            return ""
-
-        filename = _find_filename(msg.get("payload", {})) or "unknown"
+        part = _attachment_id_to_part(msg.get("payload", {}), attachment_id)
+        if part:
+            filename = part.get("filename") or "unknown"
     except Exception:
-        pass  # Non-fatal — we can still download with the attachment ID alone
+        logger.debug("Attachment filename lookup unavailable")
 
     # Validate and resolve save path
     try:
-        safe_path = _safe_save_path(save_path, Path.home())
+        safe_path = _safe_save_path(save_path, config.token_path.parent)
         final_path = _unique_save_path(safe_path)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         return err(ERROR_FILE_NOT_FOUND, str(e))
 
     # Download attachment data — we trust list_attachments gave us a valid ID,
     # so we go straight to attachments().get() without payload verification.
     try:
         attachment = _with_retry(
-            lambda: service.users()
+            lambda: (
+                service.users()
                 .messages()
                 .attachments()
                 .get(userId="me", messageId=message_id, id=attachment_id)
                 .execute()
+            )
         )
     except HttpError as e:
         if e.resp.status == 404:
-            return err(ERROR_ATTACHMENT_NOT_FOUND,
-                       f"Attachment not found: {attachment_id} (may have been deleted or is inaccessible)")
+            return err(
+                ERROR_ATTACHMENT_NOT_FOUND,
+                f"Attachment not found: {attachment_id} (may have been deleted or is inaccessible)",
+            )
         return err(ERROR_API, str(e))
     except Exception as e:
         return err(ERROR_API, str(e))
 
-    data_b64 = attachment.get("data", "")
-    if not data_b64:
-        return err(ERROR_API, "Empty attachment data received from Gmail API")
+    try:
+        if "data" not in attachment:
+            return err(ERROR_API, "Attachment response is missing data")
+        file_data = _decode_attachment(attachment["data"])
+        final_path = _write_attachment(final_path, file_data)
+    except ValueError as exc:
+        return err(ERROR_VALIDATION, str(exc))
+    except OSError as exc:
+        return err(ERROR_FILE_NOT_FOUND, f"Could not save attachment: {exc}")
 
-    file_data = base64.urlsafe_b64decode(data_b64 + "=" * (-len(data_b64) % 4))
-
-    with open(final_path, "wb") as f:
-        f.write(file_data)
-
-    return ok({
-        "filename": filename,
-        "path": str(final_path),
-        "size": len(file_data),
-    })
+    return ok(
+        {
+            "filename": filename,
+            "path": str(final_path),
+            "size": len(file_data),
+        }
+    )
 
 
 # ── Tool: create_draft ──────────────────────────────────────────────────────
@@ -1030,7 +1108,7 @@ def create_draft(
     body: str,
     cc: str = "",
     bcc: str = "",
-    attachments: Optional[list[str]] = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """
     Create a draft email saved in Gmail's Drafts folder — not sent immediately.
@@ -1069,9 +1147,7 @@ def create_draft(
         return err(ERROR_INTERNAL, str(e))
 
     try:
-        profile = _with_retry(
-            lambda: service.users().getProfile(userId="me").execute()
-        )
+        profile = _with_retry(lambda: service.users().getProfile(userId="me").execute(), max_retries=1)
         sender = profile.get("emailAddress", "")
     except HttpError as e:
         return err(ERROR_API, f"Failed to get sender profile: {e}")
@@ -1080,32 +1156,46 @@ def create_draft(
 
     try:
         encoded, _ = _build_mime_message(
-            to=to, subject=subject, body=body,
-            cc=cc, bcc=bcc, attachments=attachments,
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            attachments=attachments,
             sender=sender,
         )
-    except FileNotFoundError as e:
+    except OSError as e:
         return err(ERROR_FILE_NOT_FOUND, str(e))
     except ValueError as e:
         return err(ERROR_VALIDATION, str(e))
 
     try:
         draft = _with_retry(
-            lambda: service.users()
-                .drafts()
-                .create(userId="me", body={"message": {"raw": encoded}})
-                .execute()
+            lambda: (
+                service.users().drafts().create(userId="me", body={"message": {"raw": encoded}}).execute()
+            ),
+            max_retries=1,
         )
     except HttpError as e:
-        return err(ERROR_API, str(e))
+        return err(
+            ERROR_API,
+            "Draft creation could not be confirmed. Check Gmail before retrying to avoid duplicates. Details: "
+            + str(e),
+        )
     except Exception as e:
-        return err(ERROR_API, str(e))
+        return err(
+            ERROR_API,
+            "Draft creation could not be confirmed. Check Gmail before retrying to avoid duplicates. Details: "
+            + str(e),
+        )
 
     msg = draft.get("message", {})
-    return ok({
-        "draft_id": draft.get("id", ""),
-        "message_id": msg.get("id", ""),
-    })
+    return ok(
+        {
+            "draft_id": draft.get("id", ""),
+            "message_id": msg.get("id", ""),
+        }
+    )
 
 
 # ── Tool: list_drafts ────────────────────────────────────────────────────────
@@ -1126,6 +1216,9 @@ def list_drafts(max_results: int = 5) -> dict:
       and delete_draft. The "subject" field shows the draft's subject line.
       Use update_draft(draft_id, body="new content") to edit a draft.
     """
+    if type(max_results) is not int or not 1 <= max_results <= 500:
+        return err(ERROR_VALIDATION, "max_results must be an integer between 1 and 500")
+
     try:
         service = _get_service()
     except AuthError as e:
@@ -1152,44 +1245,58 @@ def list_drafts(max_results: int = 5) -> dict:
         if msg_id:
             try:
                 msg = _with_retry(
-                    lambda mid=msg_id: service.users()
+                    lambda mid=msg_id: (
+                        service.users()
                         .messages()
-                        .get(userId="me", id=mid, format="metadata",
-                             metadataHeaders=["Subject", "From", "To", "Date"])
+                        .get(
+                            userId="me",
+                            id=mid,
+                            format="metadata",
+                            metadataHeaders=["Subject", "From", "To", "Date"],
+                        )
                         .execute()
+                    )
                 )
-                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                drafts_list.append({
-                    "id": draft_id,
-                    "subject": headers.get("Subject", "(no subject)"),
-                    "from": headers.get("From", "unknown"),
-                    "to": headers.get("To", ""),
-                    "date": headers.get("Date", ""),
-                    "snippet": msg.get("snippet", ""),
-                })
+                headers = _headers(msg.get("payload", {}))
+                drafts_list.append(
+                    {
+                        "id": draft_id,
+                        "subject": headers.get("subject", "(no subject)"),
+                        "from": headers.get("from", "unknown"),
+                        "to": headers.get("to", ""),
+                        "date": headers.get("date", ""),
+                        "snippet": msg.get("snippet", ""),
+                    }
+                )
             except Exception:
-                drafts_list.append({
+                drafts_list.append(
+                    {
+                        "id": draft_id,
+                        "subject": "(unable to fetch)",
+                        "from": "unknown",
+                        "to": "",
+                        "date": "",
+                        "snippet": "",
+                    }
+                )
+        else:
+            drafts_list.append(
+                {
                     "id": draft_id,
-                    "subject": "(unable to fetch)",
+                    "subject": "(no message)",
                     "from": "unknown",
                     "to": "",
                     "date": "",
                     "snippet": "",
-                })
-        else:
-            drafts_list.append({
-                "id": draft_id,
-                "subject": "(no message)",
-                "from": "unknown",
-                "to": "",
-                "date": "",
-                "snippet": "",
-            })
+                }
+            )
 
-    return ok({
-        "total": len(drafts_list),
-        "drafts": drafts_list,
-    })
+    return ok(
+        {
+            "total": len(drafts_list),
+            "drafts": drafts_list,
+        }
+    )
 
 
 # ── Tool: update_draft ──────────────────────────────────────────────────────
@@ -1200,105 +1307,97 @@ def update_draft(
     body: str = "",
     cc: str = "",
     bcc: str = "",
-    attachments: Optional[list[str]] = None,
+    attachments: list[str] | None = None,
 ) -> dict:
+    """Update a draft body, preserving omitted headers, threading and attachments.
+
+    body is required. Empty to/subject/cc/bcc retain existing values.
+    attachments=None preserves existing files; [] explicitly removes them.
     """
-    Update an existing draft. Only non-empty fields are replaced.
-    Body is required — drafts must have content.
-
-    Required:
-      draft_id (str) — draft ID from list_drafts.
-      body (str) — new body text. REQUIRED — drafts must have a body.
-
-    Optional:
-      to (str, default="") — new recipient. If empty, keeps existing.
-      subject (str, default="") — new subject. If empty, keeps existing.
-      cc (str, default="") — new CC.
-      bcc (str, default="") — new BCC.
-      attachments (list[str] | None, default=None) — replace attachments.
-
-    Returns on success:
-      {"draft_id": "...", "message_id": "..."}
-
-    Workflow note: body is the only required field — all others are
-      optional and retain their current values if not provided.
-      Call list_drafts() first to get the draft_id.
-    """
-    if attachments is None:
-        attachments = []
+    from copy import deepcopy
+    from email import policy
+    from email.parser import BytesParser
 
     if not draft_id or not draft_id.strip():
-        return err(ERROR_VALIDATION, "draft_id cannot be empty")
-
+        return err(ERROR_VALIDATION, "draft_id is required when updating a draft")
     if not body:
         return err(ERROR_VALIDATION, "body is required when updating a draft")
-
     try:
         service = _get_service()
-    except AuthError as e:
-        return err(ERROR_AUTH_MISSING, str(e))
-    except Exception as e:
-        logger.exception("Unexpected error obtaining Gmail service")
-        return err(ERROR_INTERNAL, str(e))
-
+    except AuthError as exc:
+        return err(ERROR_AUTH_MISSING, str(exc))
+    except Exception as exc:
+        return err(ERROR_INTERNAL, str(exc))
     try:
         current = _with_retry(
-            lambda: service.users().drafts().get(userId="me", id=draft_id).execute()
+            lambda: service.users().drafts().get(userId="me", id=draft_id, format="raw").execute()
         )
-    except HttpError as e:
-        if e.resp.status == 404:
-            return err(ERROR_DRAFT_NOT_FOUND, f"Draft not found: {draft_id}")
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    msg = current.get("message", {})
-    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-
-    final_to = to or headers.get("To", "")
-    final_subject = subject or headers.get("Subject", "")
-
-    try:
-        profile = _with_retry(
-            lambda: service.users().getProfile(userId="me").execute()
+        message = current.get("message", {})
+        raw = message.get("raw")
+        original = None
+        if raw:
+            original = BytesParser(policy=policy.default).parsebytes(
+                base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+            )
+            headers = {name.lower(): value for name, value in original.items()}
+        else:
+            payload = message.get("payload", {})
+            headers = _headers(payload)
+            if payload.get("parts") and attachments is None:
+                return err(ERROR_API, "Raw draft MIME unavailable; refusing to discard existing parts")
+        sender = _with_retry(lambda: service.users().getProfile(userId="me").execute()).get(
+            "emailAddress", ""
         )
-        sender = profile.get("emailAddress", "")
-    except HttpError as e:
-        return err(ERROR_API, f"Failed to get sender profile: {e}")
-    except Exception as e:
-        return err(ERROR_API, f"Failed to get sender profile: {e}")
-
-    try:
         encoded, _ = _build_mime_message(
-            to=final_to, subject=final_subject, body=body,
-            cc=cc, bcc=bcc, attachments=attachments,
-            sender=sender,
+            to=to or headers.get("to", ""),
+            subject=subject or headers.get("subject", ""),
+            body=body,
+            cc=cc or headers.get("cc", ""),
+            bcc=bcc or headers.get("bcc", ""),
+            attachments=attachments,
+            sender=headers.get("from", sender),
+            in_reply_to=headers.get("in-reply-to", ""),
+            references=headers.get("references", ""),
         )
-    except FileNotFoundError as e:
-        return err(ERROR_FILE_NOT_FOUND, str(e))
-    except ValueError as e:
-        return err(ERROR_VALIDATION, str(e))
+        rebuilt = BytesParser(policy=policy.default).parsebytes(
+            base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        )
+        if attachments is None and original is not None:
 
-    try:
+            def retained_parts(message):
+                for part in message.iter_parts():
+                    if part.get_content_disposition() in ("attachment", "inline") or part.get_filename():
+                        yield part
+                    elif part.is_multipart():
+                        yield from retained_parts(part)
+
+            parts = list(retained_parts(original))
+            if parts:
+                rebuilt.make_mixed()
+                for part in parts:
+                    rebuilt.attach(deepcopy(part))
+        encoded = base64.urlsafe_b64encode(rebuilt.as_bytes()).decode("ascii").rstrip("=")
+        if len(encoded) > 35 * 1024 * 1024:
+            return err(ERROR_VALIDATION, "Updated draft exceeds the encoded message size limit")
+        update = {"raw": encoded}
+        if message.get("threadId"):
+            update["threadId"] = message["threadId"]
         updated = _with_retry(
-            lambda: service.users()
-                .drafts()
-                .update(userId="me", id=draft_id, body={"message": {"raw": encoded}})
-                .execute()
+            lambda: (
+                service.users().drafts().update(userId="me", id=draft_id, body={"message": update}).execute()
+            )
         )
-    except HttpError as e:
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
+        return ok({"draft_id": updated.get("id", ""), "message_id": updated.get("message", {}).get("id", "")})
+    except HttpError as exc:
+        return err(ERROR_DRAFT_NOT_FOUND if exc.resp.status == 404 else ERROR_API, str(exc))
+    except FileNotFoundError as exc:
+        return err(ERROR_FILE_NOT_FOUND, str(exc))
+    except (ValueError, OSError) as exc:
+        return err(ERROR_VALIDATION, str(exc))
+    except Exception as exc:
+        return err(ERROR_API, str(exc))
 
-    updated_msg = updated.get("message", {})
-    return ok({
-        "draft_id": updated.get("id", ""),
-        "message_id": updated_msg.get("id", ""),
-    })
 
-
-# ── Tool: delete_draft ──────────────────────────────────────────────────────
 def delete_draft(draft_id: str) -> dict:
     """
     Delete a draft from Gmail's Drafts folder.
@@ -1324,9 +1423,7 @@ def delete_draft(draft_id: str) -> dict:
         return err(ERROR_INTERNAL, str(e))
 
     try:
-        _with_retry(
-            lambda: service.users().drafts().delete(userId="me", id=draft_id).execute()
-        )
+        _with_retry(lambda: service.users().drafts().delete(userId="me", id=draft_id).execute())
     except HttpError as e:
         if e.resp.status == 404:
             return err(ERROR_DRAFT_NOT_FOUND, f"Draft not found: {draft_id}")
@@ -1341,22 +1438,24 @@ def delete_draft(draft_id: str) -> dict:
 def _batch_ok(data: Any, requested: int, results: list[dict]) -> dict:
     succeeded = sum(1 for r in results if r.get("ok"))
     failed = requested - succeeded
-    return ok({
-        "requested": requested,
-        "succeeded": succeeded,
-        "failed": failed,
-        "results": results,
-    })
+    return ok(
+        {
+            "requested": requested,
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }
+    )
 
 
 # ── Output size & file helpers ─────────────────────────────────────────────────
 # Bytes per email estimate for threshold comparison (JSON-encoded)
-_EMAIL_SIZE_ESTIMATE = 6000   # conservative: plain body + headers + markup
+_EMAIL_SIZE_ESTIMATE = 6000  # conservative: plain body + headers + markup
 _SUMMARY_SIZE_ESTIMATE = 500  # compact summary (date + from + subject + snippet)
 _DEFAULT_MAX_CHARS = 30000
 
 # Exposed config dir path for use in save helpers
-_CONFIG_DIR = Path.home() / ".config" / "gmail-mcp"
+_CONFIG_DIR = config.token_path.parent
 
 
 def _get_email_dir() -> Path:
@@ -1381,7 +1480,9 @@ def _build_slug(subject: str = "", query: str = "") -> str:
 
 def _make_email_path(count: int, slug: str = "") -> Path:
     """Generate a unique file path with timestamp."""
-    ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    from uuid import uuid4
+
+    ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + "-" + uuid4().hex[:12]
     slug = slug or "emails"
     base = f"{ts}-{slug}-{count}"
     email_dir = _get_email_dir()
@@ -1401,7 +1502,6 @@ def _markdown_escape(text: str) -> str:
 def _extract_email_fields(e: dict) -> dict:
     """Get a compact representation of an email for summary output."""
     d = e.get("data", {})
-    body = d.get("body") or d.get("html_body", "") or ""
     return {
         "id": d.get("id", ""),
         "date": d.get("date", "")[:10],
@@ -1420,10 +1520,7 @@ def _summary_table(results: list[dict]) -> str:
     ]
     for i, e in enumerate(results, 1):
         f = _extract_email_fields(e)
-        lines.append(
-            f"| {i} | {f['date']} | {f['from']} | "
-            f"{f['subject']} | {f['snippet']} |"
-        )
+        lines.append(f"| {i} | {f['date']} | {f['from']} | {f['subject']} | {f['snippet']} |")
     return "\n".join(lines)
 
 
@@ -1448,11 +1545,10 @@ def _build_markdown_file(results: list[dict], path: Path, query: str = "") -> di
         d = e.get("data", {})
         ok_status = "✅" if e.get("ok") else f"❌ {e.get('error', 'unknown error')}"
         body = (d.get("body") or d.get("html_body") or "").strip()
-        # Truncate very long bodies for file size
-        if len(body) > 5000:
-            body = body[:5000] + "\n\n... *(truncated)*"
 
         lines.append(f"## Email {i}/{total} {ok_status}\n")
+        if not e.get("ok"):
+            lines.append(f"**Error:** {e.get('message', e.get('error', 'unknown error'))}")
         lines.append(f"- **Date:** {d.get('date', '')}")
         lines.append(f"- **From:** {d.get('from', '')}")
         lines.append(f"- **To:** {d.get('to', '')}")
@@ -1462,7 +1558,7 @@ def _build_markdown_file(results: list[dict], path: Path, query: str = "") -> di
             lines.append(f"\n**Body:**\n\n{body}")
         lines.append("\n---\n")
 
-    path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
+    _atomic_write(path, "\n".join(lines))
     return {
         "saved": True,
         "path": str(path),
@@ -1477,30 +1573,54 @@ def _build_json_file(results: list[dict], path: Path, query: str = "") -> dict:
         "query": query,
         "saved_at": datetime.now().isoformat(),
         "total": len(results),
-        "results": [_extract_email_fields(e) for e in results],
+        "results": [_export_record(e) for e in results],
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False))
     return {"saved": True, "path": str(path), "count": len(results), "size_bytes": path.stat().st_size}
 
 
+def _export_record(result: dict) -> dict:
+    """Flatten successful records without shortening or escaping stored content."""
+    if result.get("ok"):
+        return {**result.get("data", {}), "ok": True}
+    return {key: value for key, value in result.items() if key != "data"}
+
+
 def _build_jsonl_file(results: list[dict], path: Path) -> dict:
-    """Save results as JSON Lines (one JSON per line)."""
-    with path.open("w", encoding="utf-8") as f:
-        for e in results:
-            f.write(json.dumps(_extract_email_fields(e), ensure_ascii=False) + "\n")
+    content = "".join(json.dumps(_export_record(e), ensure_ascii=False) + "\n" for e in results)
+    _atomic_write(path, content)
     return {"saved": True, "path": str(path), "count": len(results), "size_bytes": path.stat().st_size}
 
 
 def _build_csv_file(results: list[dict], path: Path) -> dict:
-    """Save results as CSV with headers: date, from, subject, snippet, labels."""
-    import csv, io
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["date", "from", "subject", "snippet", "labels", "id"])
-    for e in results:
-        f = _extract_email_fields(e)
-        w.writerow([f["date"], f["from"], f["subject"], f["snippet"], "|".join(f["labels"]), f["id"]])
-    path.write_text(buf.getvalue(), encoding="utf-8")
+    """Save complete fields, bodies, identifiers and per-message errors as CSV."""
+    import csv
+    import io
+
+    fields = [
+        "id",
+        "thread_id",
+        "date",
+        "from",
+        "to",
+        "cc",
+        "subject",
+        "snippet",
+        "labels",
+        "body",
+        "html_body",
+        "ok",
+        "error",
+        "message",
+    ]
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for result in results:
+        record = _export_record(result)
+        record["labels"] = json.dumps(record.get("labels", []), ensure_ascii=False)
+        writer.writerow(record)
+    _atomic_write(path, buf.getvalue())
     return {"saved": True, "path": str(path), "count": len(results), "size_bytes": path.stat().st_size}
 
 
@@ -1520,7 +1640,7 @@ def _save_results(results: list[dict], path: Path, fmt: str, query: str = "") ->
 
 def _extract_email_data(msg: dict) -> dict:
     """Extract structured data from a full message payload for read_emails."""
-    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    headers = _headers(msg.get("payload", {}))
     plain_body, html_body = _extract_body(msg.get("payload", {}))
     internal_date = msg.get("internalDate", "")
     if internal_date:
@@ -1529,13 +1649,14 @@ def _extract_email_data(msg: dict) -> dict:
         except Exception:
             date_str = internal_date
     else:
-        date_str = headers.get("Date", "")
+        date_str = headers.get("date", "")
     return {
         "id": msg.get("id", ""),
+        "subject": headers.get("subject", "(no subject)"),
+        "from": headers.get("from", "unknown"),
+        "to": headers.get("to", "unknown"),
+        "cc": headers.get("cc", ""),
         "thread_id": msg.get("threadId", ""),
-        "subject": headers.get("Subject", "(no subject)"),
-        "from": headers.get("From", "unknown"),
-        "to": headers.get("To", "unknown"),
         "date": date_str,
         "body": plain_body,
         "html_body": html_body,
@@ -1545,6 +1666,88 @@ def _extract_email_data(msg: dict) -> dict:
 
 
 # ── Tool: read_emails (batch via BatchHttpRequest) ────────────────────────────
+def _fetch_messages(service, message_ids: list[str]) -> list[dict]:
+    """Execute bounded read batches, retaining duplicates, order and partial errors."""
+    results: dict[str, dict] = {}
+
+    def callback(request_id, response, exception):
+        if exception:
+            results[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
+        else:
+            try:
+                _prepare_body(service, response)
+                results[request_id] = {"ok": True, "data": _extract_email_data(response)}
+            except Exception as exc:
+                results[request_id] = err(ERROR_API, f"Invalid message response: {exc}")
+
+    for start in range(0, len(message_ids), 100):
+        batch = service.new_batch_http_request(callback=callback)
+        for index in range(start, min(start + 100, len(message_ids))):
+            batch.add(
+                service.users().messages().get(userId="me", id=message_ids[index], format="full"),
+                request_id=str(index),
+            )
+        try:
+            _with_retry(lambda current=batch: current.execute(http=service._http))
+        except Exception as exc:
+            for index in range(start, min(start + 100, len(message_ids))):
+                results.setdefault(str(index), err(ERROR_API, str(exc)))
+    return [
+        {"id": mid, **results.get(str(index), err(ERROR_API, "No response received"))}
+        for index, mid in enumerate(message_ids)
+    ]
+
+
+def _resolve_label(service, label: str) -> str:
+    system = {
+        "INBOX",
+        "SPAM",
+        "TRASH",
+        "UNREAD",
+        "STARRED",
+        "IMPORTANT",
+        "SENT",
+        "DRAFT",
+        "CHAT",
+        "CATEGORY_PERSONAL",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES",
+        "CATEGORY_FORUMS",
+    }
+    if label in system:
+        return label
+    labels = _with_retry(lambda: service.users().labels().list(userId="me").execute()).get("labels", [])
+    for item in labels:
+        if label in (item.get("id"), item.get("name")):
+            return item["id"]
+    raise ValueError(f"Gmail label not found: {label}")
+
+
+def _bulk_modify(service, message_ids: list[str], add: list[str], remove: list[str]) -> dict:
+    out: list[dict] = []
+    try:
+        add = [_resolve_label(service, label) for label in add]
+        remove = [_resolve_label(service, label) for label in remove]
+    except ValueError as exc:
+        return err(ERROR_INVALID_LABEL, str(exc))
+    except Exception as exc:
+        return err(ERROR_API, str(exc))
+    for start in range(0, len(message_ids), 1000):
+        ids = message_ids[start : start + 1000]
+        body = {"ids": ids, "addLabelIds": add, "removeLabelIds": remove}
+        try:
+            _with_retry(
+                lambda current=body: (
+                    service.users().messages().batchModify(userId="me", body=current).execute()
+                )
+            )
+            out.extend({"id": mid, "ok": True} for mid in ids)
+        except Exception as exc:
+            out.extend({"id": mid, **err(ERROR_API, str(exc))} for mid in ids)
+    return _batch_ok(None, len(message_ids), out)
+
+
 def read_emails(
     message_ids: list[str],
     save_to_file: bool = False,
@@ -1554,12 +1757,12 @@ def read_emails(
     CHOICE HINT: When the user asks to "read", "show", or "fetch" content from
     multiple emails (e.g. "read these 5 emails", "show me the latest 3 emails"),
     ALWAYS prefer this tool over making N calls to read_email(). It bundles all
-    N Gmail API calls into a single HTTP request — far more efficient.
+    Gmail API calls into bounded HTTP batches.
 
     Fetch full content of multiple emails in a single MCP request.
 
-    Uses googleapiclient.http.BatchHttpRequest — all N calls are bundled
-    into ONE HTTP round-trip, regardless of how many message_ids are passed.
+    Uses googleapiclient.http.BatchHttpRequest — calls are bundled
+    into batches of up to 100 per HTTP round-trip.
     Handles up to 100 messages per call automatically.
 
     Optional:
@@ -1603,48 +1806,32 @@ def read_emails(
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    results: dict[str, dict] = {}
-
-    def callback(request_id: str, response: dict, exception: Exception) -> None:
-        if exception:
-            results[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
-        else:
-            results[request_id] = {"ok": True, "data": _extract_email_data(response)}
-
-    batch = service.new_batch_http_request(callback=callback)
-    for mid in message_ids:
-        batch.add(
-            service.users().messages().get(userId="me", id=mid, format="full"),
-            request_id=mid,
-        )
-
-    try:
-        _with_retry(lambda: batch.execute(http=service._http))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    out = []
-    for mid in message_ids:
-        r = results.get(mid, {"ok": False, "error": ERROR_API, "message": "No response received"})
-        out.append({"id": mid, **r})
+    out = _fetch_messages(service, message_ids)
 
     # Auto-save if forced or estimated size exceeds threshold
-    estimated_chars = _estimate_output_size(len(message_ids))
+    estimated_chars = max(_estimate_output_size(len(message_ids)), len(json.dumps(out, ensure_ascii=False)))
     if save_to_file or estimated_chars > max_chars:
-        slug = _build_slug(query="batch-fetch", subject=out[0].get("data", {}).get("subject", "") if out else "")
-        path = _make_email_path(len(message_ids), slug)
-        saved = _save_results(out, path, "md", query=f"Batch fetch {len(message_ids)} emails")
-        return ok({
-            "saved": True,
-            "path": saved["path"],
-            "count": saved["count"],
-            "size_bytes": saved["size_bytes"],
-            "summary_table": _summary_table(out),
-            "requested": len(message_ids),
-            "succeeded": sum(1 for r in out if r.get("ok")),
-            "failed": sum(1 for r in out if not r.get("ok")),
-            "results": [_extract_email_fields(e) for e in out],
-        })
+        slug = _build_slug(
+            query="batch-fetch", subject=out[0].get("data", {}).get("subject", "") if out else ""
+        )
+        try:
+            path = _make_email_path(len(message_ids), slug)
+            saved = _save_results(out, path, "md", query=f"Batch fetch {len(message_ids)} emails")
+        except OSError as exc:
+            return err(ERROR_FILE_NOT_FOUND, f"Could not save export: {exc}")
+        return ok(
+            {
+                "saved": True,
+                "path": saved["path"],
+                "count": saved["count"],
+                "size_bytes": saved["size_bytes"],
+                "summary_table": _summary_table(out),
+                "requested": len(message_ids),
+                "succeeded": sum(1 for r in out if r.get("ok")),
+                "failed": sum(1 for r in out if not r.get("ok")),
+                "results": [_extract_email_fields(e) for e in out],
+            }
+        )
 
     return _batch_ok(None, len(message_ids), out)
 
@@ -1654,12 +1841,11 @@ def mark_emails_read(message_ids: list[str]) -> dict:
     """
     CHOICE HINT: When the user asks to "mark as read" or "mark read" multiple
     emails, ALWAYS prefer this tool over making N calls to mark_read(). It uses
-    Gmail's batchModify API — ONE API call regardless of how many message IDs.
+    Gmail's batchModify API in chunks of at most 1000 message IDs.
 
     Mark multiple emails as read in a single MCP request.
 
-    Uses messages().batchModify() — ONE Gmail API call regardless of
-    how many message_ids are passed (up to 1000 per call).
+    Uses messages().batchModify() with up to 1000 IDs per Gmail API call.
 
     Required:
       message_ids (list[str]) — Gmail message IDs.
@@ -1684,31 +1870,18 @@ def mark_emails_read(message_ids: list[str]) -> dict:
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    body = {"removeLabelIds": ["UNREAD"], "ids": message_ids}
-    try:
-        _with_retry(
-            lambda: service.users().messages().batchModify(userId="me", body=body).execute()
-        )
-    except HttpError as e:
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    results = [{"id": mid, "ok": True} for mid in message_ids]
-    return _batch_ok(None, len(message_ids), results)
+    return _bulk_modify(service, message_ids, [], ["UNREAD"])
 
 
-# ── Tool: archive_emails (batchModify) ───────────────────────────────────────
 def archive_emails(message_ids: list[str]) -> dict:
     """
     CHOICE HINT: When the user asks to "archive" or "remove from inbox" multiple
     emails, ALWAYS prefer this tool over making N calls to archive_email(). It uses
-    Gmail's batchModify API — ONE API call regardless of how many message IDs.
+    Gmail's batchModify API in chunks of at most 1000 message IDs.
 
     Archive multiple emails in a single MCP request.
 
-    Uses messages().batchModify() — ONE Gmail API call regardless of
-    how many message_ids are passed (up to 1000 per call).
+    Uses messages().batchModify() with up to 1000 IDs per Gmail API call.
 
     Required:
       message_ids (list[str]) — Gmail message IDs.
@@ -1732,31 +1905,18 @@ def archive_emails(message_ids: list[str]) -> dict:
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    body = {"removeLabelIds": ["INBOX"], "ids": message_ids}
-    try:
-        _with_retry(
-            lambda: service.users().messages().batchModify(userId="me", body=body).execute()
-        )
-    except HttpError as e:
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    results = [{"id": mid, "ok": True} for mid in message_ids]
-    return _batch_ok(None, len(message_ids), results)
+    return _bulk_modify(service, message_ids, [], ["INBOX"])
 
 
-# ── Tool: trash_emails (batchModify) ─────────────────────────────────────────
 def trash_emails(message_ids: list[str]) -> dict:
     """
     CHOICE HINT: When the user asks to "trash" or "delete" multiple emails,
     ALWAYS prefer this tool over making N calls to trash_email(). It uses
-    Gmail's batchModify API — ONE API call regardless of how many message IDs.
+    Gmail's batchModify API in chunks of at most 1000 message IDs.
 
     Move multiple emails to trash in a single MCP request.
 
-    Uses messages().batchModify() — ONE Gmail API call regardless of
-    how many message_ids are passed (up to 1000 per call).
+    Uses messages().batchModify() with up to 1000 IDs per Gmail API call.
 
     Required:
       message_ids (list[str]) — Gmail message IDs.
@@ -1780,31 +1940,18 @@ def trash_emails(message_ids: list[str]) -> dict:
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    body = {"addLabelIds": ["TRASH"], "ids": message_ids}
-    try:
-        _with_retry(
-            lambda: service.users().messages().batchModify(userId="me", body=body).execute()
-        )
-    except HttpError as e:
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    results = [{"id": mid, "ok": True} for mid in message_ids]
-    return _batch_ok(None, len(message_ids), results)
+    return _bulk_modify(service, message_ids, ["TRASH"], [])
 
 
-# ── Tool: add_labels (batchModify) ───────────────────────────────────────────
 def add_labels(message_ids: list[str], label: str) -> dict:
     """
     CHOICE HINT: When the user asks to "add a label" to multiple emails,
     ALWAYS prefer this tool over making N calls to add_label(). It uses
-    Gmail's batchModify API — ONE API call regardless of how many message IDs.
+    Gmail's batchModify API in chunks of at most 1000 message IDs.
 
     Add a label to multiple emails in a single MCP request.
 
-    Uses messages().batchModify() — ONE Gmail API call regardless of
-    how many message_ids are passed (up to 1000 per call).
+    Uses messages().batchModify() with up to 1000 IDs per Gmail API call.
 
     Required:
       message_ids (list[str]) — Gmail message IDs.
@@ -1833,135 +1980,72 @@ def add_labels(message_ids: list[str], label: str) -> dict:
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    body = {"addLabelIds": [label], "ids": message_ids}
-    try:
-        _with_retry(
-            lambda: service.users().messages().batchModify(userId="me", body=body).execute()
-        )
-    except HttpError as e:
-        return err(ERROR_API, str(e))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    results = [{"id": mid, "ok": True} for mid in message_ids]
-    return _batch_ok(None, len(message_ids), results)
+    return _bulk_modify(service, message_ids, [label], [])
 
 
-# ── Tool: download_attachments (batch via BatchHttpRequest) ────────────────────
 def download_attachments(items: list[dict]) -> dict:
-    """
-    CHOICE HINT: When the user asks to "download" attachments from multiple emails
-    or "download all files" from an email thread, ALWAYS prefer this tool over
-    making N calls to download_attachment(). It bundles all N Gmail API calls into
-    a single HTTP request — far more efficient.
-
-    Download multiple email attachments in a single MCP request.
-
-    Uses googleapiclient.http.BatchHttpRequest — all N calls are bundled
-    into ONE HTTP round-trip, regardless of how many items are passed.
-    Handles up to 100 attachments per call automatically.
-
-    Required:
-      items (list[dict]) — each dict must contain:
-        - message_id (str): Gmail message ID
-        - attachment_id (str): attachment ID from list_attachments
-        - save_path (str): local file path to save to
-
-    Returns on success:
-      {"ok": true, "data": {
-        "requested": N, "succeeded": N, "failed": 0,
-        "results": [{"message_id": "...", "attachment_id": "...", "ok": true, "data": {...}}, ...]
-      }}
-
-    Workflow note: Use this instead of N download_attachment() calls.
-      Paths are validated against path traversal. Files are renamed
-      if they already exist (e.g., "report (1).pdf").
-    """
+    """Download attachments in batches of 100, preserving input order and unique files."""
     if not items:
         return _batch_ok(None, 0, [])
-
     try:
         service = _get_service()
-    except AuthError as e:
-        return err(ERROR_AUTH_MISSING, str(e))
-    except Exception as e:
-        logger.exception("Unexpected error obtaining Gmail service")
-        return err(ERROR_INTERNAL, str(e))
-
+    except AuthError as exc:
+        return err(ERROR_AUTH_MISSING, str(exc))
+    except Exception as exc:
+        return err(ERROR_INTERNAL, str(exc))
     results: dict[str, dict] = {}
-    config_dir = Path.home()
-
-    def callback(request_id: str, response: dict, exception: Exception) -> None:
-        if exception:
-            results[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
-        else:
-            results[request_id] = {"ok": True, "data": response}
-
-    batch = service.new_batch_http_request(callback=callback)
-
-    # Pre-validate all save paths before executing
-    validated = []
     out = []
-    for item in items:
-        mid = item.get("message_id", "")
-        att_id = item.get("attachment_id", "")
-        save_path = item.get("save_path", "")
-
-        if not mid or not att_id or not save_path:
-            out.append({
-                "message_id": mid, "attachment_id": att_id,
-                "ok": False, "error": ERROR_VALIDATION,
-                "message": "Each item needs message_id, attachment_id, and save_path"
-            })
+    valid = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            out.append(err(ERROR_VALIDATION, "Attachment item must be an object"))
             continue
-
-        try:
-            safe_path = _safe_save_path(save_path, config_dir)
-            final_path = _unique_save_path(safe_path)
-        except ValueError as e:
-            out.append({
-                "message_id": mid, "attachment_id": att_id,
-                "ok": False, "error": ERROR_FILE_NOT_FOUND, "message": str(e)
-            })
+        mid, aid, path = (item.get(k, "") for k in ("message_id", "attachment_id", "save_path"))
+        out.append({"message_id": mid, "attachment_id": aid})
+        if not all(isinstance(value, str) and value.strip() for value in (mid, aid, path)):
+            out[index].update(
+                err(ERROR_VALIDATION, "Each item needs message_id, attachment_id, and save_path")
+            )
             continue
-
-        validated.append((mid, att_id, str(final_path)))
-        batch.add(
-            service.users().messages().attachments().get(
-                userId="me", messageId=mid, id=att_id
-            ),
-            request_id=f"{mid}:{att_id}",
-        )
-
-    if validated:
         try:
-            _with_retry(lambda: batch.execute(http=service._http))
-        except Exception as e:
-            return err(ERROR_API, str(e))
+            safe = _safe_save_path(path, config.token_path.parent)
+        except (ValueError, OSError) as exc:
+            out[index].update(err(ERROR_FILE_NOT_FOUND, str(exc)))
+            continue
+        valid.append((index, mid, aid, safe))
 
-    # Decode and write files
-    for mid, att_id, final_path in validated:
-        rid = f"{mid}:{att_id}"
-        r = results.get(rid, {"ok": False, "error": ERROR_API, "message": "No response received"})
-        if r.get("ok"):
-            data_b64 = r["data"].get("data", "")
-            if not data_b64:
-                r = {"ok": False, "error": ERROR_API, "message": "Empty attachment data"}
-            else:
+    def callback(request_id, response, exception):
+        results[request_id] = err(ERROR_API, str(exception)) if exception else ok(response)
+
+    for start in range(0, len(valid), 100):
+        chunk = valid[start : start + 100]
+        batch = service.new_batch_http_request(callback=callback)
+        for index, mid, aid, _ in chunk:
+            batch.add(
+                service.users().messages().attachments().get(userId="me", messageId=mid, id=aid),
+                request_id=str(index),
+            )
+        try:
+            _with_retry(lambda current=batch: current.execute(http=service._http))
+        except Exception as exc:
+            for index, *_ in chunk:
+                results.setdefault(str(index), err(ERROR_API, str(exc)))
+        for index, _, _, path in chunk:
+            result = results.get(str(index), err(ERROR_API, "No response received"))
+            if result.get("ok"):
                 try:
-                    file_data = base64.urlsafe_b64decode(data_b64 + "=" * (-len(data_b64) % 4))
-                    with open(final_path, "wb") as f:
-                        f.write(file_data)
-                    r = {"ok": True, "data": {"filename": "", "path": final_path, "size": len(file_data)}}
-                except Exception as e:
-                    r = {"ok": False, "error": ERROR_API, "message": str(e)}
-
-        out.append({"message_id": mid, "attachment_id": att_id, **r})
-
+                    encoded = result["data"]["data"]
+                    data = _decode_attachment(encoded)
+                    saved = _write_attachment(path, data)
+                    result = ok({"filename": saved.name, "path": str(saved), "size": len(data)})
+                except (ValueError, KeyError, TypeError) as exc:
+                    result = err(ERROR_VALIDATION, str(exc))
+                except OSError as exc:
+                    result = err(ERROR_FILE_NOT_FOUND, str(exc))
+            out[index].update(result)
     return _batch_ok(None, len(items), out)
 
 
-# ── Tool: read_emails_full ─────────────────────────────────────────────────────
 def read_emails_full(
     message_ids: list[str],
     save_path: str,
@@ -1984,7 +2068,7 @@ def read_emails_full(
         "md"   — Markdown with summary table + full body per email
         "json" — pretty-printed JSON
         "jsonl" — one JSON object per line
-        "csv"  — CSV with headers: date, from, subject, snippet, labels, id
+        "csv"  — complete fields, text/HTML bodies, identifiers and errors
 
     Returns on success:
       {"ok": true, "data": {
@@ -1998,8 +2082,17 @@ def read_emails_full(
     Workflow note: Use this instead of read_emails() when you know the
       result will be large. Always saves — never returns data inline.
     """
+    if format not in ("md", "json", "jsonl", "csv"):
+        return err(ERROR_VALIDATION, "format must be md, json, jsonl, or csv")
     if not message_ids:
         return ok({"saved": False, "path": "", "count": 0, "format": format, "total_size_bytes": 0})
+
+    # Validate path
+    config_dir = config.token_path.parent
+    try:
+        save_p = _safe_save_path(save_path, config_dir)
+    except (ValueError, OSError) as e:
+        return err(ERROR_FILE_NOT_FOUND, str(e))
 
     try:
         service = _get_service()
@@ -2009,49 +2102,25 @@ def read_emails_full(
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    # Validate path
-    config_dir = Path.home()
-    try:
-        save_p = _safe_save_path(save_path, config_dir)
-    except ValueError as e:
-        return err(ERROR_FILE_NOT_FOUND, str(e))
-
-    results: dict[str, dict] = {}
-
-    def callback(request_id: str, response: dict, exception: Exception) -> None:
-        if exception:
-            results[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
-        else:
-            results[request_id] = {"ok": True, "data": _extract_email_data(response)}
-
-    batch = service.new_batch_http_request(callback=callback)
-    for mid in message_ids:
-        batch.add(
-            service.users().messages().get(userId="me", id=mid, format="full"),
-            request_id=mid,
-        )
-
-    try:
-        _with_retry(lambda: batch.execute(http=service._http))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    out = []
-    for mid in message_ids:
-        r = results.get(mid, {"ok": False, "error": ERROR_API, "message": "No response received"})
-        out.append({"id": mid, **r})
+    out = _fetch_messages(service, message_ids)
 
     # Ensure parent dir exists and write file
-    save_p.parent.mkdir(parents=True, exist_ok=True)
-    saved = _save_results(out, save_p, format, query=f"Exported {len(message_ids)} emails")
+    try:
+        saved = _save_results(out, save_p, format, query=f"Exported {len(message_ids)} emails")
+    except OSError as exc:
+        return err(ERROR_FILE_NOT_FOUND, f"Could not save export: {exc}")
 
-    return ok({
-        "saved": True,
-        "path": saved["path"],
-        "count": saved["count"],
-        "format": format,
-        "total_size_bytes": saved["size_bytes"],
-    })
+    return ok(
+        {
+            "saved": True,
+            "path": saved["path"],
+            "count": saved["count"],
+            "succeeded": sum(bool(item.get("ok")) for item in out),
+            "failed": sum(not item.get("ok") for item in out),
+            "format": format,
+            "total_size_bytes": saved["size_bytes"],
+        }
+    )
 
 
 # ── Tool: search_and_save ─────────────────────────────────────────────────────
@@ -2074,7 +2143,7 @@ def search_and_save(
     Optional:
       max_results (int, default=100) — max emails to fetch.
       save_path (str) — local file path. If empty, auto-generates one in
-        ~/.config/gmail-mcp/emails/.  Overwrite is rejected — use a fresh
+        the configured gmail-mcp directory under emails/.  Overwrite is rejected — use a fresh
         path or let the tool auto-generate.
       format (str, default="md") — "md", "json", "jsonl", or "csv".
 
@@ -2092,8 +2161,30 @@ def search_and_save(
     Workflow note: Use this when you want to search Gmail and immediately
       persist results to a file without worrying about MCP output limits.
     """
+    if format not in ("md", "json", "jsonl", "csv"):
+        return err(ERROR_VALIDATION, "format must be md, json, jsonl, or csv")
+    if type(max_results) is not int or not 1 <= max_results <= 5000:
+        return err(ERROR_VALIDATION, "max_results must be between 1 and 5000")
     if not query:
         return err(ERROR_VALIDATION, "query must not be empty")
+
+    # Determine save path
+    config_dir = config.token_path.parent
+    if save_path:
+        try:
+            save_p = _safe_save_path(save_path, config_dir)
+            if save_p.exists():
+                return err(
+                    ERROR_VALIDATION, "Export path already exists; choose a new path or use append_emails"
+                )
+        except (ValueError, OSError) as e:
+            return err(ERROR_FILE_NOT_FOUND, str(e))
+    else:
+        slug = _build_slug(query=query)
+        try:
+            save_p = _make_email_path(max_results, slug).with_suffix(f".{format}")
+        except OSError as exc:
+            return err(ERROR_FILE_NOT_FOUND, f"Could not create export directory: {exc}")
 
     try:
         service = _get_service()
@@ -2103,85 +2194,75 @@ def search_and_save(
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    # Determine save path
-    config_dir = Path.home()
-    if save_path:
-        try:
-            save_p = _safe_save_path(save_path, config_dir)
-        except ValueError as e:
-            return err(ERROR_FILE_NOT_FOUND, str(e))
-    else:
-        slug = _build_slug(query=query)
-        save_p = _make_email_path(max_results, slug).with_suffix(f".{format}")
-        if format != "md":
-            save_p = save_p.with_suffix(f".{format}")
-
+    message_ids: list[str] = []
+    seen_ids = set()
+    seen_tokens = set()
+    page_token = None
+    total_found = 0
     try:
-        # Step 1: search for message IDs
-        results = _with_retry(
-            lambda: service.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=max_results,
-            ).execute()
-        )
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    messages = results.get("messages", [])
-    message_ids = [m["id"] for m in messages]
-    total_found = results.get("resultSizeEstimate", len(message_ids))
+        while len(message_ids) < max_results:
+            params = {"userId": "me", "q": query, "maxResults": min(500, max_results - len(message_ids))}
+            if page_token:
+                params["pageToken"] = page_token
+            response = _with_retry(
+                lambda current=params: service.users().messages().list(**current).execute()
+            )
+            total_found = response.get("resultSizeEstimate", total_found)
+            for message in response.get("messages", []):
+                if message["id"] not in seen_ids:
+                    seen_ids.add(message["id"])
+                    message_ids.append(message["id"])
+                    if len(message_ids) == max_results:
+                        break
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+            if page_token in seen_tokens:
+                raise ValueError("Gmail returned a repeated pagination token")
+            seen_tokens.add(page_token)
+    except Exception as exc:
+        return err(ERROR_API, str(exc))
 
     if not message_ids:
-        return ok({
-            "saved": False,
-            "path": "",
-            "count": 0,
-            "format": format,
-            "total_size_bytes": 0,
-            "query": query,
-            "search_summary": "No emails matched your search query",
-        })
-
-    # Step 2: fetch full content
-    results_data: dict[str, dict] = {}
-
-    def callback(request_id: str, response: dict, exception: Exception) -> None:
-        if exception:
-            results_data[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
-        else:
-            results_data[request_id] = {"ok": True, "data": _extract_email_data(response)}
-
-    batch = service.new_batch_http_request(callback=callback)
-    for mid in message_ids:
-        batch.add(
-            service.users().messages().get(userId="me", id=mid, format="full"),
-            request_id=mid,
+        return ok(
+            {
+                "saved": False,
+                "path": "",
+                "count": 0,
+                "format": format,
+                "total_size_bytes": 0,
+                "query": query,
+                "search_summary": "No emails matched your search query",
+            }
         )
 
-    try:
-        _with_retry(lambda: batch.execute(http=service._http))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    out = []
-    for mid in message_ids:
-        r = results_data.get(mid, {"ok": False, "error": ERROR_API, "message": "No response received"})
-        out.append({"id": mid, **r})
+    # Step 2: fetch full content
+    out = _fetch_messages(service, message_ids)
 
     # Step 3: save to file
-    save_p.parent.mkdir(parents=True, exist_ok=True)
-    saved = _save_results(out, save_p, format, query=query)
+    try:
+        with _FILE_LOCK:
+            if save_p.exists():
+                return err(
+                    ERROR_VALIDATION, "Export path already exists; choose a new path or use append_emails"
+                )
+            saved = _save_results(out, save_p, format, query=query)
+    except OSError as exc:
+        return err(ERROR_FILE_NOT_FOUND, f"Could not save export: {exc}")
 
-    return ok({
-        "saved": True,
-        "path": saved["path"],
-        "count": saved["count"],
-        "format": format,
-        "total_size_bytes": saved["size_bytes"],
-        "query": query,
-        "search_summary": f"{saved['count']} emails matched your search query (found {total_found} total)",
-    })
+    return ok(
+        {
+            "saved": True,
+            "path": saved["path"],
+            "count": saved["count"],
+            "succeeded": sum(bool(item.get("ok")) for item in out),
+            "failed": sum(not item.get("ok") for item in out),
+            "format": format,
+            "total_size_bytes": saved["size_bytes"],
+            "query": query,
+            "search_summary": f"{saved['count']} emails matched your search query (found {total_found} total)",
+        }
+    )
 
 
 # ── Tool: append_emails ───────────────────────────────────────────────────────
@@ -2212,18 +2293,23 @@ def append_emails(
     if not message_ids:
         return ok({"appended": False, "path": save_path, "count": 0, "total_size_bytes": 0})
 
-    config_dir = Path.home()
+    config_dir = config.token_path.parent
     try:
         save_p = _safe_save_path(save_path, config_dir)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         return err(ERROR_FILE_NOT_FOUND, str(e))
 
     if not save_p.exists():
-        return err(ERROR_FILE_NOT_FOUND, f"File not found: {save_path}. Create it first with read_emails_full or search_and_save.")
+        return err(
+            ERROR_FILE_NOT_FOUND,
+            f"File not found: {save_path}. Create it first with read_emails_full or search_and_save.",
+        )
 
     suffix = save_p.suffix.lower()
     if suffix not in (".md", ".json", ".jsonl"):
-        return err(ERROR_VALIDATION, f"append_emails only supports .md, .json, and .jsonl files. Got: {suffix}")
+        return err(
+            ERROR_VALIDATION, f"append_emails only supports .md, .json, and .jsonl files. Got: {suffix}"
+        )
 
     try:
         service = _get_service()
@@ -2233,60 +2319,41 @@ def append_emails(
         logger.exception("Unexpected error obtaining Gmail service")
         return err(ERROR_INTERNAL, str(e))
 
-    results_data: dict[str, dict] = {}
-
-    def callback(request_id: str, response: dict, exception: Exception) -> None:
-        if exception:
-            results_data[request_id] = {"ok": False, "error": ERROR_API, "message": str(exception)}
-        else:
-            results_data[request_id] = {"ok": True, "data": _extract_email_data(response)}
-
-    batch = service.new_batch_http_request(callback=callback)
-    for mid in message_ids:
-        batch.add(
-            service.users().messages().get(userId="me", id=mid, format="full"),
-            request_id=mid,
-        )
+    out = _fetch_messages(service, message_ids)
 
     try:
-        _with_retry(lambda: batch.execute(http=service._http))
-    except Exception as e:
-        return err(ERROR_API, str(e))
-
-    out = []
-    for mid in message_ids:
-        r = results_data.get(mid, {"ok": False, "error": ERROR_API, "message": "No response received"})
-        out.append({"id": mid, **r})
-
-    # Read existing content and append
-    if suffix == ".md":
-        existing = save_p.read_text(encoding="utf-8")
-        # For .md: find the last --- divider and append after it
-        last_divider = existing.rfind("\n---\n")
-        if last_divider >= 0:
-            new_content = existing[:last_divider + 5] + "\n" + _build_markdown_body_section(out, len(message_ids))
-        else:
-            new_content = existing + "\n" + _build_markdown_body_section(out, len(message_ids))
-        save_p.write_text(new_content, encoding="utf-8")
-    elif suffix == ".json":
-        import json
-        data = json.loads(save_p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or "results" not in data:
-            return err(ERROR_VALIDATION, "Append target JSON must have a top-level 'results' array. Use read_emails_full with format='json'.")
-        data["results"].extend([_extract_email_fields(e) for e in out])
-        save_p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    else:  # .jsonl
-        with save_p.open("a", encoding="utf-8") as f:
-            for e in out:
-                f.write(json.dumps(_extract_email_fields(e), ensure_ascii=False) + "\n")
-
-    size = save_p.stat().st_size
-    return ok({
-        "appended": True,
-        "path": str(save_p),
-        "count": len(out),
-        "total_size_bytes": size,
-    })
+        with _FILE_LOCK:
+            existing = save_p.read_text(encoding="utf-8")
+            if suffix == ".md":
+                new_content = existing + "\n" + _build_markdown_body_section(out, len(message_ids))
+            elif suffix == ".json":
+                data = json.loads(existing)
+                if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                    return err(ERROR_VALIDATION, "Append target JSON must have a top-level 'results' array.")
+                data["results"].extend(_export_record(e) for e in out)
+                data["total"] = len(data["results"])
+                new_content = json.dumps(data, indent=2, ensure_ascii=False)
+            else:
+                # Validate the existing JSON Lines before changing it.
+                for line in existing.splitlines():
+                    if line.strip():
+                        json.loads(line)
+                new_content = existing + ("\n" if existing and not existing.endswith("\n") else "")
+                new_content += "".join(json.dumps(_export_record(e), ensure_ascii=False) + "\n" for e in out)
+            _atomic_write(save_p, new_content)
+            size = save_p.stat().st_size
+    except (ValueError, UnicodeError) as exc:
+        return err(ERROR_VALIDATION, f"Invalid append target: {exc}")
+    except OSError as exc:
+        return err(ERROR_FILE_NOT_FOUND, f"Could not update export: {exc}")
+    return ok(
+        {
+            "appended": True,
+            "path": str(save_p),
+            "count": len(out),
+            "total_size_bytes": size,
+        }
+    )
 
 
 def _build_markdown_body_section(results: list[dict], total: int) -> str:
@@ -2297,10 +2364,12 @@ def _build_markdown_body_section(results: list[dict], total: int) -> str:
         d = e.get("data", {})
         body = d.get("body") or d.get("html_body", "") or ""
         lines.append(f"## Email {start_num + i}/{total}")
+        if not e.get("ok"):
+            lines.append(f"**Error:** {e.get('message', e.get('error', 'unknown error'))}")
         lines.append(f"**Date:** {d.get('date', '')}")
         lines.append(f"**From:** {d.get('from', '')}")
         lines.append(f"**Subject:** {d.get('subject', '')}")
         lines.append(f"**Labels:** {', '.join(d.get('labels', []))}")
-        lines.append(f"\n**Body:**\n\n{body[:2000]}")
+        lines.append(f"\n**Body:**\n\n{body}")
         lines.append("\n---\n")
     return "\n".join(lines)

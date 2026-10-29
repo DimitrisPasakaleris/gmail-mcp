@@ -13,15 +13,16 @@ storage.
 ## Highlights
 
 - **25 tools** across single, batch, and file-export families — see [`docs/TOOLS.md`](docs/TOOLS.md).
-- **Batch operations** that bundle up to 100 Gmail calls per MCP request
-  (`read_emails`, `add_labels`, `archive_emails`, …) for fast bulk workflows.
+- **Batch operations** with automatic chunks of 100 message reads/downloads
+  or 1000 label updates per Gmail request, preserving order and partial failures.
 - **File-export tools** (`read_emails_full`, `search_and_save`, `append_emails`)
   save results to `.md` / `.json` / `.jsonl` / `.csv` so MCP output limits
   aren't hit when working with hundreds of emails.
-- **Resilient**: exponential-backoff retry on 429/503, respects `Retry-After`,
-  recovers from transient network failures.
+- **Resilient**: bounded retry on safe operations, respecting `Retry-After`.
+  Sending mail and creating drafts are attempted once to avoid duplicates.
 - **Secure token storage** via OS keyring (optional) or filesystem (default).
-- **Tested**: ~700 lines of unit tests, mocked Google client, no network in CI.
+- **Tested**: offline regression tests, mocked Gmail responses, and an actual MCP
+  startup/tool-listing test. CI covers Windows, macOS, and Linux.
 
 ## Quick start
 
@@ -34,22 +35,35 @@ Then:
 
 1. Get a `credentials.json` from Google Cloud Console — see
    [`docs/google-cloud-setup.md`](docs/google-cloud-setup.md).
-2. Place it at the OS config dir (`~/.config/gmail-mcp/credentials.json` on
-   Linux/macOS, `%APPDATA%\gmail-mcp\credentials.json` on Windows).
-3. Run `gmail-mcp` once in a terminal — it opens a browser for the OAuth flow
-   and caches the token.
-4. Register with Claude Desktop:
+2. Place it at the [OS config directory](#configuration): Linux uses
+   `~/.config/gmail-mcp/`; macOS uses `~/Library/Application Support/gmail-mcp/`;
+   Windows uses `%APPDATA%\gmail-mcp\`.
+3. Authenticate in a terminal with a browser, using the Python environment
+   where you installed this package:
 
    ```bash
-   mcp install src/gmail_mcp/server.py --name gmail-mcp
+   python -c "from gmail_mcp.auth import get_gmail_service; get_gmail_service()"
    ```
 
-   Or, if you installed via pip, the `gmail-mcp` console script works too:
+   This opens Google's sign-in page and caches the token. Server startup is lazy:
+   launching `gmail-mcp` alone waits for MCP requests and does not start sign-in.
+4. Add this server to your MCP client's configuration. For Claude Desktop,
+   merge the following into `claude_desktop_config.json`:
 
-   ```bash
-   mcp install $(which gmail-mcp) --name gmail-mcp
+   ```json
+   {
+     "mcpServers": {
+       "gmail-mcp": {
+         "command": "/absolute/path/to/your/python",
+         "args": ["-m", "gmail_mcp"]
+       }
+     }
+   }
    ```
 
+   Replace `command` with the Python executable from the installed environment.
+   On Windows, use an escaped path such as `C:\\path\\to\\venv\\Scripts\\python.exe`.
+   Other MCP clients can launch the same command and arguments, or `gmail-mcp`.
 5. Restart Claude Desktop. Try: *"List my 5 most recent unread emails."*
 
 ## Configuration
@@ -85,6 +99,7 @@ Full parameter reference and examples: [`docs/TOOLS.md`](docs/TOOLS.md).
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module map, request flow, design decisions.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common errors and fixes.
 - [`docs/TOOLS.md`](docs/TOOLS.md) — every tool, every parameter, every response.
+- [`docs/AUDIT.md`](docs/AUDIT.md) — reliability audit, compatibility changes, and validation limits.
 
 ## Contributing
 

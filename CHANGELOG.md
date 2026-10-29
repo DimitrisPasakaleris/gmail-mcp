@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Keep MCP stdio output free of logs and OAuth prompts; use stderr if file logging is unavailable.
+- Constrain all installer metadata to MCP SDK 1.x, which provides the FastMCP API used here.
+- Pass Gmail thread IDs and RFC Message-ID/References correctly; resolve headers case-insensitively
+  and exclude the authenticated user from automatic reply-all recipients.
+- Preserve omitted draft recipients, threading, attachments, and nested inline images during edits.
+- Avoid automatic retries of sends and draft creation after ambiguous failures; report recovery guidance.
+- Bound retry delays and attempts, honor valid Retry-After values, and avoid sleeping after the last attempt.
+- Chunk reads/downloads at 100 requests and modifications at 1000 IDs, preserving duplicates,
+  result order and partial failures. Resolve custom label names to Gmail IDs.
+- Decode declared MIME charsets, skip attached text files, and fetch separately stored text bodies.
+- Validate attachment data and size; allow empty files and reserve unique download names exclusively.
+- Preserve complete bodies and fields in exports, update JSON totals on append, and retain Markdown tails.
+- Write tokens and exports atomically; serialize concurrent appends within a server process.
+- Use configured paths consistently; validate result limits and formats; correct authentication/client setup docs.
+- Use a separate Google API transport per worker thread and recognize desktop macOS as browser-capable.
+
+### Added
+- Regression coverage for protocol startup, threading, ambiguous sends, draft edits, batch boundaries,
+  pagination, attachment safety, complete exports, token storage, and concurrent operations.
+- Isolated offline test files and credentials, plus an audit report documenting checks and limitations.
+
+### Compatibility
+- JSON/JSONL/CSV exports now contain complete records and error status instead of shortened summary fields.
+- `update_draft(attachments=None)` keeps files; `attachments=[]` removes them. Empty recipient/subject
+  parameters retain their existing values.
+
 ## [1.0.0] - 2026-05-17
 
 ### Added

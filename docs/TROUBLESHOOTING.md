@@ -40,7 +40,8 @@ To work around:
 The cached `token.json` is stale.
 
 1. Delete `token.json` from the config dir.
-2. Run `gmail-mcp` once interactively. A browser opens for re-auth.
+2. Run `python -c "from gmail_mcp.auth import get_gmail_service; get_gmail_service()"`
+   interactively from the installed environment. A browser opens for re-auth.
 3. The new token is saved automatically.
 
 If this keeps happening, check whether the OAuth app is still in *Testing*
@@ -49,7 +50,9 @@ Production* on the OAuth consent screen if you want a stable token.
 
 ## 429 / 503 errors persist after retries
 
-The server already retries 429 and 503 up to 3 times with exponential backoff.
+Safe operations retry 429 and 503 up to 3 attempts with bounded backoff.
+Mail sends and draft creation are attempted once: check Gmail before retrying
+after an uncertain result, because the original request may have been accepted.
 If you still see them, you're hitting Gmail's rate limit:
 
 - **Quota**: 1 billion quota units per day, 250 units/user/sec.

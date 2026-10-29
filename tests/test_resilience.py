@@ -1,14 +1,13 @@
 """Tests for resilience features: retry, safe save paths, get_thread_messages."""
-import os
-import tempfile
-from unittest.mock import MagicMock, patch
+
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 from googleapiclient.errors import HttpError
 
-from gmail_mcp.tools import _with_retry, _safe_save_path, _unique_save_path, get_thread_messages
+from gmail_mcp.tools import _safe_save_path, _unique_save_path, _with_retry, get_thread_messages
+
 from .conftest import build_mock_service
 
 
@@ -23,6 +22,7 @@ class TestRetry:
     def test_retries_on_429_then_succeeds(self):
         """Retries 429 and returns result on success."""
         attempts = []
+
         def fragile():
             attempts.append(1)
             if len(attempts) < 2:
@@ -39,6 +39,7 @@ class TestRetry:
     def test_retries_on_503_then_succeeds(self):
         """Retries 503 and returns result on success."""
         attempts = []
+
         def fragile():
             attempts.append(1)
             if len(attempts) < 2:
@@ -55,6 +56,7 @@ class TestRetry:
     def test_respects_retry_after_header(self):
         """On 429 with Retry-After header, uses that value instead of backoff."""
         attempts = []
+
         def fragile():
             attempts.append(1)
             if len(attempts) < 2:
@@ -65,14 +67,16 @@ class TestRetry:
             return "success"
 
         import time
+
         start = time.time()
         result = _with_retry(fragile, max_retries=3, base_delay=10)
-        elapsed = time.time() - start
+        time.time() - start
         assert result == "success"
         assert len(attempts) == 2
 
     def test_raises_after_max_retries_exhausted(self):
         """After all retries fail, raises the last exception."""
+
         def always_429():
             resp = MagicMock()
             resp.status = 429
@@ -84,6 +88,7 @@ class TestRetry:
 
     def test_does_not_retry_non_rate_limit_errors(self):
         """400 errors propagate immediately without retry."""
+
         def always_400():
             resp = MagicMock()
             resp.status = 400
@@ -133,6 +138,7 @@ class TestSafeSavePath:
         so we test mkdir failure instead (simpler and reliable).
         """
         import stat
+
         protected = tmp_path / "protected"
         protected.mkdir()
         # Remove write permission from parent
@@ -193,7 +199,7 @@ class TestGetThreadMessages:
         mock_service = build_mock_service()
         resp = MagicMock()
         resp.status = 404
-        mock_service.users().threads().get.return_value.execute.side_effect = HttpError(resp, b'not found')
+        mock_service.users().threads().get.return_value.execute.side_effect = HttpError(resp, b"not found")
 
         with patch("gmail_mcp.tools._get_service", return_value=mock_service):
             result = get_thread_messages("nonexistent_thread")

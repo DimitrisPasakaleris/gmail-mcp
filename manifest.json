@@ -14,12 +14,12 @@
   },
   "dependencies": {
     "required": [
-      "mcp>=1.0.0",
+      "mcp>=1.0.0,<2",
       "google-api-python-client>=2.0.0",
       "google-auth-httplib2>=0.2.0",
       "google-auth-oauthlib>=1.0.0",
       "keyring>=25.0.0"
     ]
   },
-  "instructions": "Install: 1) Download credentials.json from Google Cloud Console (see docs/google-cloud-setup.md), 2) Run 'pip install -e .' from the project root, 3) Run 'gmail-mcp' (or 'python -m gmail_mcp') once to authenticate, 4) Register with Claude Desktop via 'mcp install src/gmail_mcp/server.py --name gmail-mcp'."
+  "instructions": "Install with pip install -e .; place credentials.json in your OS config directory (see README.md); authenticate with python -c \"from gmail_mcp.auth import get_gmail_service; get_gmail_service()\"; configure your MCP client to launch the installed environment's Python with arguments -m gmail_mcp."
 }

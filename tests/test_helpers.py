@@ -1,5 +1,6 @@
 import base64
-from gmail_mcp.tools import _parse_recipients, _extract_body, _attachment_id_to_part
+
+from gmail_mcp.tools import _attachment_id_to_part, _extract_body, _parse_recipients
 
 
 class TestParseRecipients:
@@ -57,8 +58,14 @@ class TestExtractBody:
         payload = {
             "mimeType": "multipart/alternative",
             "parts": [
-                {"mimeType": "text/plain", "body": {"data": base64.urlsafe_b64encode(b"plain").decode().rstrip("=")}},
-                {"mimeType": "text/html", "body": {"data": base64.urlsafe_b64encode(b"<p>html</p>").decode().rstrip("=")}},
+                {
+                    "mimeType": "text/plain",
+                    "body": {"data": base64.urlsafe_b64encode(b"plain").decode().rstrip("=")},
+                },
+                {
+                    "mimeType": "text/html",
+                    "body": {"data": base64.urlsafe_b64encode(b"<p>html</p>").decode().rstrip("=")},
+                },
             ],
         }
         plain, html = _extract_body(payload)
@@ -72,12 +79,15 @@ class TestExtractBody:
                 {
                     "mimeType": "multipart/alternative",
                     "parts": [
-                        {"mimeType": "text/plain", "body": {"data": base64.urlsafe_b64encode(b"deep plain").decode().rstrip("=")}},
+                        {
+                            "mimeType": "text/plain",
+                            "body": {"data": base64.urlsafe_b64encode(b"deep plain").decode().rstrip("=")},
+                        },
                     ],
                 },
             ],
         }
-        plain, html = _extract_body(deep)
+        plain, _html = _extract_body(deep)
         assert plain == "deep plain"
 
     def test_no_matching_part(self):
@@ -122,11 +132,7 @@ class TestAttachmentIdToPart:
         assert result["filename"] == "deep.txt"
 
     def test_not_found(self):
-        payload = {
-            "parts": [
-                {"filename": "other.txt", "body": {"attachmentId": "att_other", "size": 10}}
-            ]
-        }
+        payload = {"parts": [{"filename": "other.txt", "body": {"attachmentId": "att_other", "size": 10}}]}
         result = _attachment_id_to_part(payload, "att_nonexistent")
         assert result is None
 

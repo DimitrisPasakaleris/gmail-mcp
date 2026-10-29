@@ -1,8 +1,32 @@
 import base64
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_filesystem(monkeypatch, tmp_path, request):
+    """Never create test files or read tokens in the developer's real home."""
+    from gmail_mcp import auth, tools
+
+    if request.node.get_closest_marker("integration") and os.environ.get("GMAIL_TEST_REAL") == "1":
+        yield
+        return
+
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(tempfile, "tempdir", str(home / "tmp"))
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(tools, "_CONFIG_DIR", home / "config")
+    for name in ("token_path", "credentials_path", "log_path"):
+        monkeypatch.setattr(auth.config, name, home / "config" / getattr(auth.config, name).name)
+    auth.clear_service_cache()
+    yield
+    auth.clear_service_cache()
 
 
 def sample_message_payload(
@@ -11,7 +35,7 @@ def sample_message_payload(
     from_addr: str = "sender@example.com",
     to_addr: str = "recipient@example.com",
     body_text: str = "Hello, world!",
-    labels: list = None,
+    labels: list | None = None,
     snippet: str = "Hello, world!",
 ) -> dict:
     if labels is None:
@@ -105,13 +129,13 @@ def sample_draft_response(draft_id: str = "draft_001", msg_id: str = "msg_draft_
 
 
 def build_mock_service(
-    messages_list_response: dict = None,
-    messages_get_response: dict = None,
-    profile_response: dict = None,
-    send_response: dict = None,
-    modify_response: dict = None,
-    attachment_response: dict = None,
-    labels: list = None,
+    messages_list_response: dict | None = None,
+    messages_get_response: dict | None = None,
+    profile_response: dict | None = None,
+    send_response: dict | None = None,
+    modify_response: dict | None = None,
+    attachment_response: dict | None = None,
+    labels: list | None = None,
 ) -> MagicMock:
     if labels is None:
         labels = ["INBOX", "IMPORTANT"]
@@ -209,5 +233,3 @@ def real_gmail_enabled():
 
 
 # Re-export _with_retry for test use
-from gmail_mcp.tools import _with_retry
-from gmail_mcp.config import config as real_config

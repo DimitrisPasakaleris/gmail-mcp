@@ -1,32 +1,46 @@
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-import pytest
-
-from gmail_mcp.tools import (
-    ok, err,
-    list_emails, get_thread_messages,
-    send_email,
-    reply_email,
-    archive_email, trash_email, mark_read, add_label, remove_label,
-    read_email,
-    create_draft, list_drafts, update_draft, delete_draft,
-    list_attachments, download_attachment,
-    _with_retry, _safe_save_path,
-    # batch tools
-    read_emails, mark_emails_read, archive_emails,
-    trash_emails, add_labels, download_attachments,
-    # file export tools
-    read_emails_full, search_and_save, append_emails,
-    _build_markdown_file,
-)
 from gmail_mcp.auth import AuthError
+from gmail_mcp.tools import (
+    _build_markdown_file,
+    add_label,
+    add_labels,
+    append_emails,
+    archive_email,
+    archive_emails,
+    create_draft,
+    delete_draft,
+    download_attachment,
+    download_attachments,
+    err,
+    list_attachments,
+    list_emails,
+    mark_emails_read,
+    mark_read,
+    ok,
+    read_email,
+    # batch tools
+    read_emails,
+    # file export tools
+    read_emails_full,
+    remove_label,
+    reply_email,
+    search_and_save,
+    send_email,
+    trash_email,
+    trash_emails,
+    update_draft,
+)
 
 from .conftest import (
-    sample_message_payload, sample_multipart_message,
-    sample_attachment_payload, sample_draft_response, build_mock_service,
+    build_mock_service,
+    sample_attachment_payload,
+    sample_draft_response,
+    sample_message_payload,
+    sample_multipart_message,
 )
 
 
@@ -60,6 +74,7 @@ class TestListEmails:
 
     def test_api_error_returns_error(self):
         from googleapiclient.errors import HttpError
+
         mock_service = build_mock_service()
         mock_service.users().messages().list.return_value.execute.side_effect = HttpError(
             MagicMock(), b'{"error": "api_error"}'
@@ -97,10 +112,12 @@ class TestSendEmail:
         mock_service = build_mock_service()
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
             send_email(
-                to="test@example.com", subject="Test", body="Hello",
+                to="test@example.com",
+                subject="Test",
+                body="Hello",
                 thread_id="thread_xyz",
                 in_reply_to="<msg123@example.com>",
-                references="<msg123@example.com>"
+                references="<msg123@example.com>",
             )
         # Threading is handled via MIME headers in the raw body, not an API parameter.
         # Verify the send() was called successfully (message went through).
@@ -110,8 +127,10 @@ class TestSendEmail:
         mock_service = build_mock_service()
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
             result = send_email(
-                to="test@example.com", subject="Test", body="Hello",
-                attachments=["nonexistent_file_abcxyz.pdf"]
+                to="test@example.com",
+                subject="Test",
+                body="Hello",
+                attachments=["nonexistent_file_abcxyz.pdf"],
             )
         assert result["ok"] is False
         assert result["error"] == "file_not_found"
@@ -147,15 +166,17 @@ class TestReplyEmail:
 
     def test_original_message_not_found(self):
         from googleapiclient.errors import HttpError
+
         mock_service = build_mock_service()
         resp = MagicMock()
         resp.status = 404
-        mock_service.users().messages().get.return_value.execute.side_effect = HttpError(resp, b'{"error": "not_found"}')
+        mock_service.users().messages().get.return_value.execute.side_effect = HttpError(
+            resp, b'{"error": "not_found"}'
+        )
 
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
             result = reply_email(
-                to="test@example.com", body="Hello",
-                thread_id="thread_001", in_reply_to="nonexistent"
+                to="test@example.com", body="Hello", thread_id="thread_001", in_reply_to="nonexistent"
             )
         assert result["ok"] is False
         assert result["error"] == "not_found"
@@ -222,10 +243,11 @@ class TestReadEmail:
 
     def test_404_returns_not_found(self):
         from googleapiclient.errors import HttpError
+
         mock_service = build_mock_service()
         resp = MagicMock()
         resp.status = 404
-        mock_service.users().messages().get.return_value.execute.side_effect = HttpError(resp, b'{}')
+        mock_service.users().messages().get.return_value.execute.side_effect = HttpError(resp, b"{}")
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
             result = read_email("nonexistent")
         assert result["ok"] is False
@@ -282,10 +304,11 @@ class TestDraftManagement:
 
     def test_delete_draft_404_returns_error(self):
         from googleapiclient.errors import HttpError
+
         mock_service = build_mock_service()
         resp = MagicMock()
         resp.status = 404
-        mock_service.users().drafts().delete.return_value.execute.side_effect = HttpError(resp, b'{}')
+        mock_service.users().drafts().delete.return_value.execute.side_effect = HttpError(resp, b"{}")
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
             result = delete_draft("nonexistent")
         assert result["ok"] is False
@@ -315,7 +338,6 @@ class TestAttachmentTools:
             assert os.path.exists(save_path)
 
     def test_download_attachment_not_found_returns_error(self):
-        from googleapiclient.errors import HttpError
         mock_service = build_mock_service()
         mock_service.users().messages().get.return_value.execute.return_value = sample_attachment_payload()
         with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
@@ -465,7 +487,9 @@ class TestBatchTools:
 
     def test_download_attachments_auth_error(self):
         with patch("gmail_mcp.tools.get_gmail_service", side_effect=AuthError("auth failed")):
-            result = download_attachments([{"message_id": "msg_003", "attachment_id": "att_001", "save_path": "/tmp/test.txt"}])
+            result = download_attachments(
+                [{"message_id": "msg_003", "attachment_id": "att_001", "save_path": "/tmp/test.txt"}]
+            )
         assert result["ok"] is False
         assert result["error"] == "auth_missing"
 
@@ -476,9 +500,11 @@ class TestBatchTools:
         batch_mock.execute = lambda http=None: None
         mock_service.new_batch_http_request.return_value = batch_mock
 
-        with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = download_attachments([{"message_id": "msg_003"}])
+        with (
+            patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service),
+            tempfile.TemporaryDirectory(),
+        ):
+            result = download_attachments([{"message_id": "msg_003"}])
         assert result["ok"] is True
         assert result["data"]["requested"] == 1
         assert result["data"]["failed"] == 1
@@ -491,18 +517,19 @@ class TestBatchTools:
         batch_mock.execute = lambda http=None: None
         mock_service.new_batch_http_request.return_value = batch_mock
 
-        with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = download_attachments([
-                    {"message_id": "msg_003", "attachment_id": "att_001", "save_path": tmpdir + "/file.txt"}
-                ])
+        with (
+            patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = download_attachments(
+                [{"message_id": "msg_003", "attachment_id": "att_001", "save_path": tmpdir + "/file.txt"}]
+            )
         assert result["ok"] is True
         mock_service.new_batch_http_request.assert_called_once()
         batch_mock.add.assert_called_once()
 
 
 class TestFileExportTools:
-
     def test_read_emails_full_empty_ids(self):
         """Empty message_ids returns empty saved result."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -562,9 +589,11 @@ class TestFileExportTools:
         batch_mock.execute = lambda http=None: None
         mock_service.new_batch_http_request.return_value = batch_mock
 
-        with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = read_emails_full(["msg_001", "msg_002"], tmpdir + "/out.md")
+        with (
+            patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = read_emails_full(["msg_001", "msg_002"], tmpdir + "/out.md")
         assert result["ok"] is True
         mock_service.new_batch_http_request.assert_called_once()
         assert batch_mock.add.call_count == 2
@@ -605,8 +634,28 @@ class TestBuildMarkdownFile:
     def test_all_ok_entries_render_emoji_status(self):
         """All-ok entries show ✅ status icons."""
         results = [
-            {"ok": True, "data": {"body": "Body A", "from": "a@example.com", "subject": "Subject A", "date": "2026-05-11", "to": "me@test.com", "labels": ["INBOX"]}},
-            {"ok": True, "data": {"body": "Body B", "from": "b@example.com", "subject": "Subject B", "date": "2026-05-12", "to": "me@test.com", "labels": []}},
+            {
+                "ok": True,
+                "data": {
+                    "body": "Body A",
+                    "from": "a@example.com",
+                    "subject": "Subject A",
+                    "date": "2026-05-11",
+                    "to": "me@test.com",
+                    "labels": ["INBOX"],
+                },
+            },
+            {
+                "ok": True,
+                "data": {
+                    "body": "Body B",
+                    "from": "b@example.com",
+                    "subject": "Subject B",
+                    "date": "2026-05-12",
+                    "to": "me@test.com",
+                    "labels": [],
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "emails.md"
@@ -619,9 +668,29 @@ class TestBuildMarkdownFile:
     def test_mixed_ok_and_error_entries_render_both_statuses(self):
         """Mixed ok/error entries show both ✅ and ❌ status icons."""
         results = [
-            {"ok": True, "data": {"body": "Good email", "from": "a@example.com", "subject": "Subject A", "date": "2026-05-11", "to": "me@test.com", "labels": ["INBOX"]}},
+            {
+                "ok": True,
+                "data": {
+                    "body": "Good email",
+                    "from": "a@example.com",
+                    "subject": "Subject A",
+                    "date": "2026-05-11",
+                    "to": "me@test.com",
+                    "labels": ["INBOX"],
+                },
+            },
             {"ok": False, "error": "not_found", "data": {}},
-            {"ok": True, "data": {"body": "Another good", "from": "c@example.com", "subject": "Subject C", "date": "2026-05-13", "to": "me@test.com", "labels": []}},
+            {
+                "ok": True,
+                "data": {
+                    "body": "Another good",
+                    "from": "c@example.com",
+                    "subject": "Subject C",
+                    "date": "2026-05-13",
+                    "to": "me@test.com",
+                    "labels": [],
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "emails.md"
@@ -644,28 +713,47 @@ class TestBuildMarkdownFile:
             assert "❌ api_error" in content
             # Must not crash on missing body/from/subject
 
-    def test_truncates_long_bodies(self):
-        """Bodies over 5000 chars are truncated."""
+    def test_preserves_long_bodies(self):
+        """Full exports preserve bodies over 5000 characters."""
         long_body = "x" * 6000
         results = [
-            {"ok": True, "data": {"body": long_body, "from": "a@test.com", "subject": "Long", "date": "2026-05-11", "to": "me@test.com", "labels": []}},
+            {
+                "ok": True,
+                "data": {
+                    "body": long_body,
+                    "from": "a@test.com",
+                    "subject": "Long",
+                    "date": "2026-05-11",
+                    "to": "me@test.com",
+                    "labels": [],
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "emails.md"
-            result = _build_markdown_file(results, path)
+            _build_markdown_file(results, path)
             content = path.read_text(encoding="utf-8")
-            # Body should be truncated with marker
-            assert "... *(truncated)*" in content
+            assert long_body in content
             assert len(content) < 7000
 
     def test_missing_body_uses_html_fallback(self):
         """Entries with no body fall back to html_body."""
         results = [
-            {"ok": True, "data": {"html_body": "<p>Fallback body</p>", "from": "a@test.com", "subject": "HTML email", "date": "2026-05-11", "to": "me@test.com", "labels": []}},
+            {
+                "ok": True,
+                "data": {
+                    "html_body": "<p>Fallback body</p>",
+                    "from": "a@test.com",
+                    "subject": "HTML email",
+                    "date": "2026-05-11",
+                    "to": "me@test.com",
+                    "labels": [],
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "emails.md"
-            result = _build_markdown_file(results, path)
+            _build_markdown_file(results, path)
             content = path.read_text(encoding="utf-8")
             assert "Fallback body" in content
 
@@ -680,6 +768,7 @@ class TestDownloadAttachmentOptimization:
 
         get_call_count = [0]
         original_get = mock_service.users().messages().get.return_value.execute.return_value
+
         def count_gets(*args, **kwargs):
             get_call_count[0] += 1
             return original_get
@@ -690,9 +779,11 @@ class TestDownloadAttachmentOptimization:
         attachments_mock.get.return_value.execute.return_value = {"data": "dGVzdA=="}
         mock_service.users().messages().attachments.return_value = attachments_mock
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service):
-                result = download_attachment("msg_003", "att_001", tmpdir + "/file.txt")
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("gmail_mcp.tools.get_gmail_service", return_value=mock_service),
+        ):
+            result = download_attachment("msg_003", "att_001", tmpdir + "/file.txt")
 
         # One call to get metadata (for filename), one to attachments().get() (for data)
         assert result["ok"] is True

@@ -49,10 +49,11 @@ Or override the directory with `GMAIL_MCP_CONFIG_DIR=/custom/path`.
 ## 6. Run the OAuth flow
 
 ```bash
-gmail-mcp
+python -c "from gmail_mcp.auth import get_gmail_service; get_gmail_service()"
 ```
 
-(Or `python -m gmail_mcp` if you didn't install the console script.)
+Use the Python environment where you installed the package. The MCP server
+authenticates lazily on tool calls; running the server by itself does not start OAuth.
 
 A browser tab opens. Sign in with the test-user account, accept the scopes,
 and you'll be redirected to a `localhost` URL that shows "The authentication

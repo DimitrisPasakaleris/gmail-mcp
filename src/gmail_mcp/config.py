@@ -27,25 +27,17 @@ class Config:
     """Global configuration for the Gmail MCP server."""
 
     token_storage: TokenStorage = "filesystem"
-    credentials_path: Path = field(
-        default_factory=lambda: _default_config_dir() / "credentials.json"
-    )
-    token_path: Path = field(
-        default_factory=lambda: _default_config_dir() / "token.json"
-    )
-    log_path: Path = field(
-        default_factory=lambda: _default_config_dir() / "gmail-mcp.log"
-    )
-    scopes: list[str] = field(
-        default_factory=lambda: ["https://mail.google.com/"]
-    )
+    credentials_path: Path = field(default_factory=lambda: _default_config_dir() / "credentials.json")
+    token_path: Path = field(default_factory=lambda: _default_config_dir() / "token.json")
+    log_path: Path = field(default_factory=lambda: _default_config_dir() / "gmail-mcp.log")
+    scopes: list[str] = field(default_factory=lambda: ["https://mail.google.com/"])
     service_name: str = "gmail-mcp"
 
     def __post_init__(self):
         # Resolve to absolute paths
-        self.credentials_path = Path(self.credentials_path).resolve()
-        self.token_path = Path(self.token_path).resolve()
-        self.log_path = Path(self.log_path).resolve()
+        self.credentials_path = Path(self.credentials_path).expanduser().resolve()
+        self.token_path = Path(self.token_path).expanduser().resolve()
+        self.log_path = Path(self.log_path).expanduser().resolve()
 
 
 config = Config()
